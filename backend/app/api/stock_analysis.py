@@ -4,7 +4,7 @@
 
 端点:
   GET  /levels?symbol=         11 类关键价位(图表 markLine 数据源)
-  POST /analyze                AI 流式四维分析(NDJSON)
+  POST /analyze                AI 流式四维分析(SSE)
   GET  /reports                历史报告列表
   POST /reports                保存一条报告
   DELETE /reports/{report_id}  删除一条报告
@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api.sse_format import SSE_HEADERS, sse_event
 from app.indicators.levels import compute_levels, summarize_levels
 from app.services import stock_reports
 from app.services.stock_analyzer import analyze_stock_stream
@@ -153,10 +154,16 @@ class AnalyzeRequest(BaseModel):
 
 @router.post("/analyze")
 async def analyze_stock(request: Request, req: AnalyzeRequest):
-    """AI 个股四维分析 — NDJSON 流式返回。
+    """AI 个股四维分析 — SSE (text/event-stream) 流式返回。
 
     组合 K 线(技术指标)+ 财务表 + 关键价位 → 客观技术分析提示词 →
-    流式调用 LLM → 逐 chunk 以 NDJSON 推给前端(每行一个 JSON)。
+    流式调用 LLM → 逐 chunk 以标准 SSE data 帧推给前端。
+
+    协议(每个事件一条 data 行, JSON):
+      {"type":"meta","symbol","summary","levels"}
+      {"type":"delta","content":"..."}
+      {"type":"error","message":"..."}
+      {"type":"done"}
     """
     if not req.symbol:
         raise HTTPException(400, "symbol 不能为空")
@@ -166,12 +173,12 @@ async def analyze_stock(request: Request, req: AnalyzeRequest):
 
     async def stream_gen():
         async for chunk in analyze_stock_stream(repo, data_dir, req.symbol, req.focus):
-            yield chunk + "\n"
+            yield sse_event(chunk)
 
     return StreamingResponse(
         stream_gen(),
-        media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
     )
 
 

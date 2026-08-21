@@ -44,6 +44,20 @@ def test_normalize_openai_base_url_strips_trailing_slash():
     assert normalize_openai_base_url("https://open.bigmodel.cn/api/paas/v4/") == "https://open.bigmodel.cn/api/paas/v4"
 
 
+def test_openai_kwargs_omits_max_tokens_when_unset():
+    """max_tokens=None 时不向上游传输出上限(修复长报告/策略代码被截断)。"""
+    kwargs = ai_provider._openai_kwargs(temperature=0.5, max_tokens=None)
+    assert "max_tokens" not in kwargs
+    assert kwargs["temperature"] == 0.5
+
+
+def test_openai_kwargs_keeps_explicit_max_tokens():
+    """连通性测试等场景显式传小值时, max_tokens 仍要照传。"""
+    kwargs = ai_provider._openai_kwargs(temperature=None, max_tokens=8)
+    assert kwargs["max_tokens"] == 8
+    assert "temperature" not in kwargs
+
+
 def test_format_openai_error_hides_html_gateway_body():
     response = httpx.Response(
         504,

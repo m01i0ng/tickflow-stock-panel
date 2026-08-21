@@ -5,7 +5,7 @@
   - market_overview_builder.build_market_overview: 大盘背景 (指数/情绪/涨停)
 
 架构 (复刻 market_recap):
-  预计算轮动信号 → 拼装 prompt → stream_ai_text 流式调用 → NDJSON 协议输出
+  预计算轮动信号 → 拼装 prompt → stream_ai_text 流式调用 → 输出流式事件(API 层包装为 SSE)
   协议事件: meta(摘要) / delta(文本片段) / error / done
 """
 from __future__ import annotations
@@ -308,7 +308,7 @@ async def analyze_rotation_stream(
     kind: str = "concept",
     level: int | None = None,
 ) -> AsyncIterator[str]:
-    """流式维度轮动分析(概念或行业): yield 出每个 NDJSON 事件。
+    """流式维度轮动分析(概念或行业): yield 出每个流式事件(JSON 串)。
 
     Args:
         repo: KlineRepository (必填)。
@@ -371,7 +371,6 @@ async def analyze_rotation_stream(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4000,
         ):
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 

@@ -169,7 +169,6 @@ class AIStrategyGenerator:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=3000,
         ):
             yield chunk
 
@@ -313,7 +312,6 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=3000,
         )
         return self._extract_code_block(content)
 

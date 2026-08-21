@@ -36,6 +36,17 @@ def filter(df: pl.DataFrame, params: dict) -> pl.Expr:
 '''
 
 
+def parse_sse_events(body: str) -> list[dict]:
+    """解析 SSE 响应体: 每个事件一行 data: {json}, 空行分隔。"""
+    events = []
+    for frame in body.split("\n\n"):
+        frame = frame.strip()
+        if not frame.startswith("data: "):
+            continue
+        events.append(json.loads(frame[len("data: "):]))
+    return events
+
+
 @pytest.mark.asyncio
 async def test_build_strategy_stream_yields_delta_and_normalized_result(monkeypatch):
     async def fake_stream(self, prompt):
@@ -53,11 +64,12 @@ async def test_build_strategy_stream_yields_delta_and_normalized_result(monkeypa
     )
 
     response = await build_strategy_stream(req, None)
+    assert response.media_type == "text/event-stream"
     body = b""
     async for chunk in response.body_iterator:
         body += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
 
-    events = [json.loads(line) for line in body.decode("utf-8").splitlines()]
+    events = parse_sse_events(body.decode("utf-8"))
 
     assert [event["type"] for event in events] == ["meta", "delta", "delta", "result"]
     result = events[-1]
@@ -91,11 +103,12 @@ async def test_build_strategy_stream_repairs_missing_meta_once(monkeypatch):
     )
 
     response = await build_strategy_stream(req, None)
+    assert response.media_type == "text/event-stream"
     body = b""
     async for chunk in response.body_iterator:
         body += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
 
-    result = json.loads(body.decode("utf-8").splitlines()[-1])
+    result = parse_sse_events(body.decode("utf-8"))[-1]
     assert calls == 1
     assert result["type"] == "result"
     assert result["valid"] is True

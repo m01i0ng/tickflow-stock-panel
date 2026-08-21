@@ -193,10 +193,14 @@ async def generate_ai_text(
     messages: Sequence[Message],
     *,
     temperature: float | None = 0.3,
-    max_tokens: int = 3000,
+    max_tokens: int | None = None,
     timeout: float = 180.0,
 ) -> str:
-    """Return a complete AI response from the currently configured provider."""
+    """Return a complete AI response from the currently configured provider.
+
+    max_tokens 为 None 时不向上游传输出上限,使用 provider 默认值 ——
+    避免长报告 / 策略代码被硬上限从中截断(仅连通性测试等场景显式传小值)。
+    """
     if is_codex_cli_provider():
         return await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
     return await _run_openai_once(
@@ -211,13 +215,15 @@ async def stream_ai_text(
     messages: Sequence[Message],
     *,
     temperature: float | None = 0.5,
-    max_tokens: int = 4000,
+    max_tokens: int | None = None,
     timeout: float = 180.0,
 ) -> AsyncIterator[str]:
     """Yield text deltas from the configured provider.
 
     Codex CLI only exposes the final assistant message for this use case, so it
     yields one complete chunk after the command exits.
+
+    max_tokens 为 None 时不向上游传输出上限,使用 provider 默认值。
     """
     if is_codex_cli_provider():
         yield await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
@@ -236,7 +242,7 @@ async def _run_openai_once(
     messages: Sequence[Message],
     *,
     temperature: float | None,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout: float,
 ) -> str:
     ai_key = secrets_store.get_ai_key()
@@ -275,7 +281,7 @@ async def _stream_openai(
     messages: Sequence[Message],
     *,
     temperature: float | None,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout: float,
 ) -> AsyncIterator[str]:
     ai_key = secrets_store.get_ai_key()
@@ -350,9 +356,11 @@ def _is_temperature_rejected(exc: Exception) -> bool:
     return any(h in text.lower() for h in _TEMP_REJECT_HINTS)
 
 
-def _openai_kwargs(*, temperature: float | None, max_tokens: int) -> dict:
-    """Build OpenAI create() kwargs; temperature omitted when None."""
-    kwargs: dict = {"max_tokens": max_tokens}
+def _openai_kwargs(*, temperature: float | None, max_tokens: int | None) -> dict:
+    """Build OpenAI create() kwargs; temperature/max_tokens omitted when unset."""
+    kwargs: dict = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     if temperature is not None:
         kwargs["temperature"] = temperature
     return kwargs
@@ -451,7 +459,7 @@ def _compact_error_text(text: str) -> str:
 async def _run_codex_cli(
     messages: Sequence[Message],
     *,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout: float,
 ) -> str:
     prompt = _codex_prompt(messages, max_tokens=max_tokens)
@@ -584,14 +592,14 @@ def _make_writable_and_retry(
         raise exc_info[1] from None
 
 
-def _codex_prompt(messages: Sequence[Message], *, max_tokens: int) -> str:
+def _codex_prompt(messages: Sequence[Message], *, max_tokens: int | None) -> str:
     parts = [
         "You are TickFlow Stock Panel's local AI provider.",
         "This is a text-generation task. The working directory is intentionally empty.",
         "Use only the user-provided prompt content below; do not inspect or modify local files.",
         "Return only the final requested content; do not include execution logs.",
     ]
-    if max_tokens > 0:
+    if max_tokens:
         parts.append(f"Keep the final answer within about {max_tokens} output tokens.")
     for message in messages:
         role = message.get("role", "user")

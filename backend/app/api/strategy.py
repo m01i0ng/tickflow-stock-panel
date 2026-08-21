@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api.sse_format import SSE_HEADERS, sse_event
 from app.backtest.minute_trigger import MINUTE_EXIT_TRIGGER_SIGNALS
 from app.strategy import config as strategy_config
 from app.strategy.ai_generator import AIStrategyGenerator, find_meta_assignment
@@ -780,6 +781,14 @@ async def build_strategy(req: BuildRequest, request: Request):
 
 @router.post("/build/stream")
 async def build_strategy_stream(req: BuildRequest, request: Request):
+    """AI 策略构建 — SSE (text/event-stream) 流式返回策略代码 delta。
+
+    协议:
+      {"type":"meta","strategy_id","step"}
+      {"type":"delta","content":"..."}
+      {"type":"result", ...}
+      {"type":"error","message":"..."}
+    """
     try:
         prompt = _build_prompt(req)
     except ValueError as e:
@@ -788,11 +797,11 @@ async def build_strategy_stream(req: BuildRequest, request: Request):
     async def event_generator():
         gen = AIStrategyGenerator()
         chunks: list[str] = []
-        yield json.dumps({"type": "meta", "strategy_id": req.strategy_id, "step": req.step}, ensure_ascii=False) + "\n"
+        yield sse_event(json.dumps({"type": "meta", "strategy_id": req.strategy_id, "step": req.step}, ensure_ascii=False))
         try:
             async for chunk in gen.stream(prompt):
                 chunks.append(chunk)
-                yield json.dumps({"type": "delta", "content": chunk}, ensure_ascii=False) + "\n"
+                yield sse_event(json.dumps({"type": "delta", "content": chunk}, ensure_ascii=False))
             result = gen.validate_code("".join(chunks))
             if gen.needs_structural_repair(result):
                 result = await gen.repair_code(result["code"], result["error"])
@@ -800,13 +809,13 @@ async def build_strategy_stream(req: BuildRequest, request: Request):
                 result = _normalize_build_result(result, req.strategy_id, req.name, req.description)
             elif req.strategy_id:
                 result = _normalize_build_result(result, req.strategy_id)
-            yield json.dumps({"type": "result", **result}, ensure_ascii=False) + "\n"
+            yield sse_event(json.dumps({"type": "result", **result}, ensure_ascii=False))
         except RuntimeError as e:
-            yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
+            yield sse_event(json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False))
         except Exception as e:
-            yield json.dumps({"type": "error", "message": f"AI生成失败: {e}"}, ensure_ascii=False) + "\n"
+            yield sse_event(json.dumps({"type": "error", "message": f"AI生成失败: {e}"}, ensure_ascii=False))
 
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 

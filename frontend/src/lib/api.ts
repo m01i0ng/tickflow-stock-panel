@@ -42,6 +42,46 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   return res.json() as Promise<T>
 }
 
+// ===== SSE (text/event-stream) 流式响应解析 =====
+// 后端流式端点返回标准 SSE:每个事件一行 `data: {json}`, 空行结尾。
+// 用 fetch + ReadableStream 解析(而非 EventSource), 以支持 POST body。
+
+/** 解析一个 SSE 帧, 返回全部 data 行拼接后的文本; 注释/心跳帧返回 null。 */
+export function parseSseFrame(frame: string): string | null {
+  const dataLines: string[] = []
+  for (const line of frame.split('\n')) {
+    if (line.startsWith(':')) continue
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
+  }
+  return dataLines.length ? dataLines.join('\n') : null
+}
+
+/** 读取 SSE 响应, 逐帧 yield data 内容。 */
+export async function* readSseStream(res: Response): AsyncGenerator<string> {
+  if (!res.body) throw new Error('响应无 body')
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    // \r\n 归一化为 \n, 帧分隔统一按空行处理
+    buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    let idx: number
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, idx)
+      buf = buf.slice(idx + 2)
+      const data = parseSseFrame(frame)
+      if (data !== null) yield data
+    }
+  }
+  // 流结束: 兼容最后一个 data 帧没有空行收尾的情况
+  if (buf.trim()) {
+    const data = parseSseFrame(buf.replace(/\n$/, ''))
+    if (data !== null) yield data
+  }
+}
+
 // ===== Capabilities =====
 export interface CapabilityLimits {
   rpm: number | null
@@ -1980,13 +2020,14 @@ export const api = {
   /**
    * AI 财务分析 — 流式调用。
    *
-   * 返回一个可逐行读取的 async generator,每行是 JSON:
+   * 返回一个逐事件读取的 async generator,每个事件是一行 data: 上的 JSON:
    *   {type:"meta",symbol,summary,periods}
    *   {type:"delta",content:"..."}    ← 文本片段,逐个累加
    *   {type:"error",message:"..."}
    *   {type:"done"}
    *
-   * 用 ReadableStream 解析(而非 SSE EventSource),支持 POST body 且更简单。
+   * 后端为标准 SSE (text/event-stream); 用 fetch + ReadableStream 解析
+   * (而非 EventSource),支持 POST body。
    */
   async *financialAnalyzeStream(symbol: string, focus?: string): AsyncGenerator<{
     type: 'meta' | 'delta' | 'error' | 'done'
@@ -2010,29 +2051,8 @@ export const api = {
     }
     if (!res.body) throw new Error('响应无 body')
 
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      // 按行分割(保留最后不完整的行在 buf)
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        const s = line.trim()
-        if (!s) continue
-        try {
-          yield JSON.parse(s)
-        } catch {
-          // 忽略无法解析的行
-        }
-      }
-    }
-    // 处理残余
-    if (buf.trim()) {
-      try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
+    for await (const data of readSseStream(res)) {
+      try { yield JSON.parse(data) } catch { /* ignore */ }
     }
   },
 
@@ -2082,7 +2102,7 @@ export const api = {
     }>(`/api/chan/sync_minute?symbol=${encodeURIComponent(symbol)}`, { method: 'POST' }),
 
   /**
-   * AI 个股四维分析 — 流式调用(NDJSON,与财务分析同协议)。
+   * AI 个股四维分析 — 流式调用(SSE,与财务分析同协议)。
    * meta 里额外带 levels(关键价位)供图表回放。
    */
   async *stockAnalyzeStream(symbol: string, focus?: string): AsyncGenerator<{
@@ -2108,23 +2128,8 @@ export const api = {
     }
     if (!res.body) throw new Error('响应无 body')
 
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        const s = line.trim()
-        if (!s) continue
-        try { yield JSON.parse(s) } catch { /* ignore */ }
-      }
-    }
-    if (buf.trim()) {
-      try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
+    for await (const data of readSseStream(res)) {
+      try { yield JSON.parse(data) } catch { /* ignore */ }
     }
   },
 
@@ -2144,7 +2149,7 @@ export const api = {
     request<{ ok: boolean }>(`/api/market-recap/reports/${encodeURIComponent(reportId)}`, { method: 'DELETE' }),
 
   /**
-   * AI 大盘复盘 — 流式调用(NDJSON,与个股/财务分析同协议)。
+   * AI 大盘复盘 — 流式调用(SSE,与个股/财务分析同协议)。
    * meta 里带 as_of / emotion_score / emotion_label / summary,供前端先渲染信号灯。
    */
   async *reviewStream(asOf?: string, focus?: string): AsyncGenerator<{
@@ -2170,27 +2175,12 @@ export const api = {
     }
     if (!res.body) throw new Error('响应无 body')
 
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        const s = line.trim()
-        if (!s) continue
-        try { yield JSON.parse(s) } catch { /* ignore */ }
-      }
-    }
-    if (buf.trim()) {
-      try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
+    for await (const data of readSseStream(res)) {
+      try { yield JSON.parse(data) } catch { /* ignore */ }
     }
   },
 
-  /** AI 概念轮动分析 — 流式 NDJSON。 */
+  /** AI 概念轮动分析 — 流式 SSE。 */
   async *rotationAnalyzeStream(days: number, focus?: string, kind?: 'concept' | 'industry', level?: number): AsyncGenerator<{
     type: 'meta' | 'delta' | 'error' | 'done'
     days?: number
@@ -2212,23 +2202,8 @@ export const api = {
     }
     if (!res.body) throw new Error('响应无 body')
 
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        const s = line.trim()
-        if (!s) continue
-        try { yield JSON.parse(s) } catch { /* ignore */ }
-      }
-    }
-    if (buf.trim()) {
-      try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
+    for await (const data of readSseStream(res)) {
+      try { yield JSON.parse(data) } catch { /* ignore */ }
     }
   },
 
@@ -2395,23 +2370,8 @@ export const api = {
     }
     if (!res.body) throw new Error('响应无 body')
 
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        const s = line.trim()
-        if (!s) continue
-        try { yield JSON.parse(s) } catch { /* ignore */ }
-      }
-    }
-    if (buf.trim()) {
-      try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
+    for await (const data of readSseStream(res)) {
+      try { yield JSON.parse(data) } catch { /* ignore */ }
     }
   },
 

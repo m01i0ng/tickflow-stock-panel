@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api.sse_format import SSE_HEADERS, sse_event
 from app.services.financial_sync import FINANCIAL_TABLES, get_financial_df
 from app.services.financial_analyzer import analyze_financials_stream
 from app.services import ai_reports
@@ -173,11 +174,16 @@ class AnalyzeRequest(BaseModel):
 
 @router.post("/analyze")
 async def analyze_financials(request: Request, req: AnalyzeRequest):
-    """AI 财务分析 — SSE 流式返回。
+    """AI 财务分析 — SSE (text/event-stream) 流式返回。
 
     后端读取该标的财务报表与股本表 → 注入 CFA 分析师级提示词 → 流式调用 LLM →
-    逐 chunk 以 SSE 形式推给前端(JSON per line, 非 text/event-stream,
-    以便前端用 ReadableStream 逐行解析,更简单可靠)。
+    逐 chunk 以标准 SSE data 帧推给前端(每个事件一个 JSON)。
+
+    协议:
+      {"type":"meta","symbol","summary","periods"}
+      {"type":"delta","content":"..."}
+      {"type":"error","message":"..."}
+      {"type":"done"}
     """
     capset = request.app.state.capabilities
     _require_financial(capset)
@@ -189,12 +195,12 @@ async def analyze_financials(request: Request, req: AnalyzeRequest):
 
     async def stream_gen():
         async for chunk in analyze_financials_stream(data_dir, req.symbol, req.focus):
-            yield chunk + "\n"
+            yield sse_event(chunk)
 
     return StreamingResponse(
         stream_gen(),
-        media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
     )
 
 

@@ -275,7 +275,7 @@ async def analyze_stock_stream(
     symbol: str,
     focus: str = "",
 ) -> AsyncIterator[str]:
-    """流式个股分析:yield 出每个 NDJSON 事件。
+    """流式个股分析:yield 出每个流式事件(JSON 串, API 层包装为 SSE data 帧)。
 
     协议(与 financial_analyzer 一致,前端解析无差异):
       {"type":"meta","symbol","summary","levels"}  数据 + 价位摘要
@@ -321,7 +321,6 @@ async def analyze_stock_stream(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4500,
         ):
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 

@@ -1,6 +1,6 @@
 """AI 大盘复盘 —— 流式 LLM 复盘生成。
 
-复刻 stock_analyzer.py 的 NDJSON 流式协议(meta/delta/error/done),
+复刻 stock_analyzer.py 的流式事件协议(meta/delta/error/done),
 将「市场总览」聚合数据交给 LLM 生成结构化复盘报告。
 
 数据来源:services.market_overview_builder.build_market_overview
@@ -265,7 +265,7 @@ async def recap_market_stream(
     focus: str = "",
     news: list[dict] | None = None,
 ) -> AsyncIterator[str]:
-    """流式大盘复盘:yield 出每个 NDJSON 事件。
+    """流式大盘复盘:yield 出每个流式事件(JSON 串, API 层包装为 SSE data 帧)。
 
     Args:
         repo: KlineRepository(必填)。
@@ -307,7 +307,6 @@ async def recap_market_stream(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4500,
         ):
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 

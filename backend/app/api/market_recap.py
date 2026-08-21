@@ -3,7 +3,7 @@
 路由前缀: /api/market-recap
 
 端点:
-  POST /analyze                AI 流式大盘复盘(NDJSON)
+  POST /analyze                AI 流式大盘复盘(SSE)
   GET  /reports                历史复盘列表
   POST /reports                保存一条复盘报告
   DELETE /reports/{report_id}  删除一条复盘报告
@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api.sse_format import SSE_HEADERS, sse_event
 from app.services import market_recap_reports
 from app.services.market_recap import recap_market_stream
 
@@ -32,10 +33,10 @@ class AnalyzeRequest(BaseModel):
 
 @router.post("/analyze")
 async def analyze_market(request: Request, req: AnalyzeRequest):
-    """AI 大盘复盘 — NDJSON 流式返回。
+    """AI 大盘复盘 — SSE (text/event-stream) 流式返回。
 
     装配市场总览(指数/涨跌/连板/封板/板块/情绪雷达)→ 复盘提示词 →
-    流式调用 LLM → 逐 chunk 以 NDJSON 推给前端(每行一个 JSON)。
+    流式调用 LLM → 逐 chunk 以标准 SSE data 帧推给前端。
 
     协议:
       {"type":"meta","as_of","emotion_score","emotion_label","summary"}
@@ -58,12 +59,12 @@ async def analyze_market(request: Request, req: AnalyzeRequest):
 
     async def stream_gen():
         async for chunk in recap_market_stream(repo, quote_service, depth_service, as_of, req.focus):
-            yield chunk + "\n"
+            yield sse_event(chunk)
 
     return StreamingResponse(
         stream_gen(),
-        media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
     )
 
 

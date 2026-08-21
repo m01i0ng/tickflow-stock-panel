@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api.sse_format import SSE_HEADERS, sse_event
 from app.services import rps_rotation
 from app.services.concept_rotation_analyzer import analyze_rotation_stream
 
@@ -42,10 +43,10 @@ class AnalyzeRequest(BaseModel):
 
 @router.post("/rotation-analyze")
 async def analyze_rotation(request: Request, req: AnalyzeRequest):
-    """AI 维度轮动分析 — NDJSON 流式返回。
+    """AI 维度轮动分析 — SSE (text/event-stream) 流式返回。
 
     装配轮动矩阵信号 + 大盘背景 → 分析提示词 → 流式调用 LLM →
-    逐 chunk 以 NDJSON 推给前端(每行一个 JSON)。
+    逐 chunk 以标准 SSE data 帧推给前端。
 
     协议:
       {"type":"meta","days","summary"}
@@ -64,10 +65,10 @@ async def analyze_rotation(request: Request, req: AnalyzeRequest):
         async for chunk in analyze_rotation_stream(
             repo, days, req.focus, quote_service, depth_service, kind, level,
         ):
-            yield chunk + "\n"
+            yield sse_event(chunk)
 
     return StreamingResponse(
         stream_gen(),
-        media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
     )
