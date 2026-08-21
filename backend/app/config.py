@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # PyInstaller 打包后: __file__ 指向临时解压目录 _MEIPASS, 不能作为路径基准。
 # 此时:
 #   - 只读资源 (tiers.yaml / 前端 dist) 放在 _MEIPASS 内
-#   - 可写用户数据 (data_dir) 放在可执行文件旁的用户目录
+#   - 可写用户数据 (data_dir) 放在 platformdirs 用户目录, 不跟 .app / 安装目录走
 # 非 frozen 模式 (开发/Docker): 保持原有 __file__ 推导, 行为完全不变。
 _IS_FROZEN = getattr(sys, "frozen", False)
 
@@ -21,26 +21,18 @@ def _user_data_root() -> Path:
 
     定位策略 (按优先级):
       1. 环境变量 DATA_DIR (pydantic-settings 自动注入到 settings.data_dir, 不在此处理)
-      2. 打包桌面版: exe 同级的 data/ 子目录 (<安装目录>/data/)
-         —— 与程序同处一个总目录 (用户选择的安装目录), 视觉直观, 便于备份/迁移。
-      3. 非 frozen (开发模式): 项目根 data/
+      2. 打包桌面版: platformdirs 用户数据目录 (Windows %LOCALAPPDATA%\\TickFlowStockPanel,
+         macOS ~/Library/Application Support/TickFlowStockPanel)。.app 替换与 Gatekeeper
+         转移不会丢掉可写数据。
+      3. 非 frozen (开发/Docker): 项目根 data/
 
-    为什么不用 platformdirs 默认 (%LOCALAPPDATA%) 作为主路径:
-      - 落在 C 盘系统目录, 用户不易察觉, 占系统盘空间
-      - 用户期望「数据跟随程序」(便于备份/迁移)
-    为什么放 {app}/data (exe 旁的 data/) 而非 {app} 外的兄弟目录:
-      - 用户体验: 用户选了安装目录, 自然期望「程序和数据都在这」, 单一总目录更直观。
-      - 数据安全: Inno Setup 覆盖安装(升级)时只往 {app} 写新程序文件, 不会清空
-        目录里不在安装清单上的运行时文件 (data/ 即此类), 故覆盖安装不丢数据。
-        (注意: 卸载时需在 .iss 中豁免 data/, 见 packaging/tickflow.iss 的 [UninstallDelete]。)
-    旧版本数据迁移: 见 DataStore._migrate_legacy_data_dir(), 老用户首次启动自动搬迁。
+    旧版本数据迁移: 见 DataStore._migrate_legacy_data_dir()。
     """
-    # 打包桌面版: exe 同级的 data/ 子目录 (与程序同一总目录, 覆盖安装不丢数据)
     if _IS_FROZEN:
-        exe_dir = Path(sys.executable).resolve().parent
-        return exe_dir / "data"
+        from platformdirs import user_data_dir
 
-    # 开发模式: 项目根 data/
+        return Path(user_data_dir("TickFlowStockPanel", appauthor=False))
+
     return _PROJECT_ROOT / "data"
 
 
@@ -65,9 +57,16 @@ _PROJECT_ROOT = _project_root()
 _RESOURCE_ROOT = _resource_root()
 
 
+def _dotenv_path() -> str:
+    """frozen 读用户数据目录下的 .env (Finder 启动 CWD 常为 /); 开发/Docker 仍读项目根."""
+    if _IS_FROZEN:
+        return str(_user_data_root() / ".env")
+    return str(_RESOURCE_ROOT / ".env")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(_RESOURCE_ROOT / ".env") if not _IS_FROZEN else ".env",
+        env_file=_dotenv_path(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -104,7 +103,7 @@ class Settings(BaseSettings):
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。
     auth_password: str = ""
 
-    # Data — frozen: exe 同级 data/ 子目录; 非 frozen: 项目根 data/
+    # Data — frozen: platformdirs 用户目录; 非 frozen: 项目根 data/
     # (均可被环境变量 DATA_DIR 覆盖, pydantic-settings 自动注入)
     data_dir: Path = _user_data_root()
 
@@ -116,10 +115,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:
-        """确保 data_dir 是绝对路径（环境变量传入的相对路径基于项目根目录解析）。"""
+        """确保 data_dir 是绝对路径。
+
+        开发/Docker: 相对路径按项目根解析。
+        frozen: 相对 DATA_DIR 不再拼 _PROJECT_ROOT (__file__ 在 _MEIPASS), 回退 platformdirs。
+        """
         if not self.data_dir.is_absolute():
-            # 相对路径基于项目根目录解析，而非 CWD
-            self.data_dir = (_PROJECT_ROOT / self.data_dir).resolve()
+            expanded = self.data_dir.expanduser()
+            if expanded.is_absolute():
+                self.data_dir = expanded
+            elif _IS_FROZEN:
+                self.data_dir = _user_data_root()
+            else:
+                self.data_dir = (_PROJECT_ROOT / self.data_dir).resolve()
         if self.backtest_matrix_cache_max_mb <= 0:
             raise ValueError("backtest_matrix_cache_max_mb must be positive")
         if self.backtest_matrix_cache_prewarm_years <= 0:

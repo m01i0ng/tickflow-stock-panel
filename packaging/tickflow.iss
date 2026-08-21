@@ -10,10 +10,10 @@
 ;   3. 产物: packaging\Output\TickFlowStockPanel-Setup-x.x.x.exe
 ;
 ; 设计决策:
-;   - 装到用户目录 {localappdata}\Programs\ (不弹 UAC, 不需管理员)
-;   - 用户数据存在 {app}\data\ (与程序同处一个总目录, 视觉直观)
-;   - 卸载时询问是否删除用户数据 ({app}\data\)
-;   - 覆盖安装(升级)不动 data\: Inno Setup 只写程序文件, data 不在安装清单
+;   - 程序默认装到 D:\TickFlowStockPanel (D 盘不存在或不可写则回退用户目录)
+;   - 不弹 UAC, 不需管理员 (PrivilegesRequired=lowest)
+;   - 用户数据在 %LOCALAPPDATA%\TickFlowStockPanel (platformdirs), 升级不丢
+;   - 卸载时询问是否删除用户数据 (含残留 {app}\data)
 ;   - 桌面 + 开始菜单快捷方式
 ;   - 卸载入口 (控制面板可见)
 ; ===========================================================================
@@ -95,10 +95,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 ; 卸载前先关闭正在运行的应用 (否则 exe 被占用删不掉)
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "KillApp"
 
-; [UninstallDelete] 故意不删 {app}:
-; 用户数据在 {app}\data\, 若这里写 Type: filesandordirs; Name: "{app}" 会连数据一起删。
-; 卸载默认行为已足够 —— Inno Setup 会删除它安装清单内的所有程序文件, 只留下运行时
-; 生成的 data\ 目录。是否清理 data\ 由下方 [Code] 的卸载询问逻辑决定。
+; [UninstallDelete] 故意不删用户数据:
+; 运行时数据在 %LOCALAPPDATA%\TickFlowStockPanel, 旧版可能残留 {app}\data。
+; Inno Setup 只删除安装清单内的程序文件。是否清理数据由下方卸载询问决定。
 
 [Code]
 // ── 辅助函数: 判断目录是否为空 ─────────────────────────────────
@@ -132,47 +131,65 @@ begin
   Result := True;
 end;
 
-procedure InitializeWizard();
+function DriveIsWritable(const Root: String): Boolean;
 var
-  DefaultDir: String;
+  TestFile: String;
 begin
-  // D 盘存在 → 用 D 盘; 否则回退用户目录 (无需管理员权限)
-  if not DirExists('D:\') then
+  Result := False;
+  TestFile := AddBackslash(Root) + 'tickflow_write_probe.tmp';
+  if SaveStringToFile(TestFile, 'ok', False) then
   begin
-    DefaultDir := ExpandConstant('{localappdata}\Programs\TickFlowStockPanel');
-    WizardForm.DirEdit.Text := DefaultDir;
+    DeleteFile(TestFile);
+    Result := True;
   end;
 end;
 
+procedure InitializeWizard();
+begin
+  // D 盘存在且可写 → 用 D 盘; 否则回退用户目录 (无需管理员权限)
+  if (not DirExists('D:\')) or (not DriveIsWritable('D:\')) then
+    WizardForm.DirEdit.Text := ExpandConstant('{localappdata}\Programs\TickFlowStockPanel');
+end;
+
 // ── 卸载时询问是否删除用户数据 ─────────────────────────────────
-// 用户数据在 {app}\data\ (策略/选股/回测/监控/行情), 与程序同处 {app} 总目录。
-// Inno Setup 卸载默认只删它装过的程序文件, data\ 会被保留 (覆盖安装/常规卸载都不丢)。
-// 这里仅在用户明确「彻底卸载」时, 才询问是否清理 data\ + {app} 空壳。
+// 用户数据在 %LOCALAPPDATA%\TickFlowStockPanel; 旧版可能残留 {app}\data。
+// Inno Setup 卸载默认只删它装过的程序文件。彻底卸载时才询问是否清理。
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  DataDir, AppDir: String;
+  UserDataDir, AppDataDir, AppDir, Locations: String;
+  HasData: Boolean;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    // {app}\data = 用户数据目录 (与程序同总目录, 子文件夹)
-    DataDir := ExpandConstant('{app}\data');
-    if DirExists(DataDir) then
+    UserDataDir := ExpandConstant('{localappdata}\TickFlowStockPanel');
+    AppDataDir := ExpandConstant('{app}\data');
+    HasData := DirExists(UserDataDir) or DirExists(AppDataDir);
+    if HasData then
     begin
+      Locations := '';
+      if DirExists(UserDataDir) then
+        Locations := UserDataDir;
+      if DirExists(AppDataDir) then
+      begin
+        if Locations <> '' then
+          Locations := Locations + #13#10;
+        Locations := Locations + AppDataDir;
+      end;
       if SuppressibleMsgBox(
           '是否同时删除用户数据?' + #13#10 + #13#10 +
-          '位置: ' + DataDir + #13#10 +
+          '位置: ' + #13#10 + Locations + #13#10 + #13#10 +
           '内容: 行情数据、策略、选股结果、回测记录、监控规则等' + #13#10 + #13#10 +
           '选「是」彻底卸载, 选「否」保留数据(重装后可恢复)。',
           mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
       begin
-        DelTree(DataDir, True, True, True);
+        if DirExists(UserDataDir) then
+          DelTree(UserDataDir, True, True, True);
+        if DirExists(AppDataDir) then
+          DelTree(AppDataDir, True, True, True);
       end;
     end;
-    // 清理可能残留的空 {app} 壳目录 (程序文件已被 Inno Setup 删除)
     AppDir := ExpandConstant('{app}');
     if DirExists(AppDir) and IsDirEmpty(AppDir) then
-    begin
       DelTree(AppDir, True, True, True);
-    end;
   end;
 end;

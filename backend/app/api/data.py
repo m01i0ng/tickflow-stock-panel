@@ -819,28 +819,13 @@ def table_schema(request: Request, table: str) -> list[dict]:
 
 @router.get("/version")
 def get_version(request: Request) -> dict:
-    """返回当前项目版本号。
-
-    优先读 app.__version__ (与 /health 接口同源, 唯一权威版本),
-    回退到项目根 VERSION 文件, 最后兜底 v0.0.0。
-    """
+    """返回当前项目版本号, 以 app.__version__ 为准 (与 /health 同源)。"""
     from app import __version__
 
-    # 1. 优先用 app.__version__ (唯一权威版本, 打包期由 PyInstaller 注入)
-    if __version__:
-        v = __version__.strip()
-        return {"version": v if v.startswith("v") else f"v{v}"}
-
-    # 2. 回退到项目根 VERSION 文件
-    from app.config import settings
-    project_root = Path(settings.data_dir).parent
-    version_file = project_root / "VERSION"
-    if version_file.exists():
-        v = version_file.read_text(encoding="utf-8").strip()
-        if v:
-            return {"version": v}
-
-    return {"version": "v0.0.0"}
+    v = (__version__ or "").strip()
+    if not v:
+        return {"version": "v0.0.0"}
+    return {"version": v if v.startswith("v") else f"v{v}"}
 
 
 @router.post("/refresh-cache")

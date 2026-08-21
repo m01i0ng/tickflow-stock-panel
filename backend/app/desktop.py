@@ -28,6 +28,53 @@ logger = logging.getLogger(__name__)
 _APP_NAME = "TickFlow 股票面板"
 _BASE_PORT = 3018
 _PORT_PROBE_RANGE = 50  # 从 3018 起最多试 50 个端口
+_WEBVIEW2_DOWNLOAD = "https://developer.microsoft.com/microsoft-edge/webview2/"
+_uvicorn_server = None
+
+
+def _prepend_darwin_homebrew_path() -> None:
+    """Finder 启动的 .app PATH 不含 Homebrew, 把 node/tesseract 常见路径前置。"""
+    if sys.platform != "darwin" or not getattr(sys, "frozen", False):
+        return
+    import os
+
+    extras = ["/opt/homebrew/bin", "/usr/local/bin"]
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(":") if p and p not in extras]
+    os.environ["PATH"] = ":".join([*extras, *parts])
+
+
+def _webview2_available() -> bool:
+    """检测 Evergreen WebView2 Runtime (注册表 pv 或已知安装目录)。"""
+    if sys.platform != "win32":
+        return True
+    import os
+    import winreg
+
+    guid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    keys = (
+        (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{guid}"),
+        (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{guid}"),
+        (winreg.HKEY_CURRENT_USER, rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{guid}"),
+    )
+    for hive, path in keys:
+        try:
+            with winreg.OpenKey(hive, path) as key:
+                version, _ = winreg.QueryValueEx(key, "pv")
+            if version and str(version) not in ("", "0.0.0.0"):
+                return True
+        except OSError:
+            continue
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+        / "Microsoft" / "EdgeWebView" / "Application",
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Microsoft" / "EdgeWebView" / "Application",
+        Path(local) / "Microsoft" / "EdgeWebView" / "Application" if local else None,
+    ]
+    return any(p is not None and p.exists() for p in candidates)
 
 
 def _ensure_data_dir_writable() -> None:
@@ -149,23 +196,31 @@ def _setup_logging() -> None:
 
 
 def _show_crash(title: str, text: str) -> None:
-    """崩溃时弹原生 MessageBox 提示用户 (仅 Windows)。
-
-    console=False 下用户看不到任何输出, 崩溃时弹一个原生错误框, 让用户至少
-    知道「程序崩了 + 原因」, 并可截图反馈。非 Windows 用日志降级, 不调 ctypes。
-
-    ctypes 是 Python 标准库, 不引入新依赖; MessageBoxW 是 Unicode 版本 (W 后缀),
-    支持中文标题/正文。0x10 = MB_ICONERROR (红色错误图标)。
-    """
+    """崩溃时弹原生对话框。Windows 用 MessageBoxW, macOS 用 osascript。"""
     if sys.platform == "win32":
         try:
             import ctypes
 
             ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.error("弹框失败 (已写日志文件): %s", e)
-    else:
-        logger.error("%s: %s", title, text)
+        return
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+
+            def _esc(s: str) -> str:
+                return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")[:1500]
+
+            script = (
+                f'display dialog "{_esc(text)}" with title "{_esc(title)}" '
+                'buttons {"OK"} default button "OK" with icon stop'
+            )
+            subprocess.run(["osascript", "-e", script], check=False, timeout=120)
+        except Exception as e:
+            logger.error("弹框失败 (已写日志文件): %s", e)
+        return
+    logger.error("%s: %s", title, text)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -208,6 +263,7 @@ def _find_free_port(start: int, count: int = _PORT_PROBE_RANGE) -> int:
 
 def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
     """后台线程: 启动 uvicorn 服务。ready_event 在线程退出时置位 (通知主线程)。"""
+    global _uvicorn_server
     import uvicorn
 
     try:
@@ -229,11 +285,7 @@ def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
         loop="auto",
     )
     server = uvicorn.Server(config)
-
-    # 线程结束时通知主线程 (无论正常退出还是异常)
-    def _signal_done(*exc):
-        ready_event.set()
-    server.config.callback_notify = None  # 不用 notify 机制
+    _uvicorn_server = server
 
     try:
         server.run()
@@ -267,9 +319,20 @@ def _wait_for_server(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
+def _stop_uvicorn() -> None:
+    server = _uvicorn_server
+    if server is not None:
+        server.should_exit = True
+
+
 def _open_window(url: str) -> None:
     """主线程: 用 pywebview 打开桌面窗口。"""
     import webview  # type: ignore[import-not-found]
+
+    from app.config import settings
+
+    storage = settings.data_dir / "webview"
+    storage.mkdir(parents=True, exist_ok=True)
 
     window = webview.create_window(
         _APP_NAME,
@@ -277,11 +340,14 @@ def _open_window(url: str) -> None:
         width=1440,
         height=900,
         min_size=(1024, 700),
-        # 桌面版固定单窗口, 禁用外部浏览器跳转
         confirm_close=False,
+        text_select=True,
     )
-    # pywebview 会阻塞主线程直到窗口关闭
-    webview.start(debug=False)
+    def _on_closed(*_a, **_k):
+        _stop_uvicorn()
+
+    window.events.closed += _on_closed
+    webview.start(debug=False, private_mode=False, storage_path=str(storage))
 
 
 def main() -> int:
@@ -296,6 +362,15 @@ def main() -> int:
     # 追加文件日志: console=False 下 stderr 被吞, 必须落盘否则查无对证。
     # 放在 basicConfig 之后 (它先建好 root logger 的格式), 这里只追加 handler。
     _setup_logging()
+    _prepend_darwin_homebrew_path()
+
+    if sys.platform == "win32" and not _webview2_available():
+        _show_crash(
+            "缺少 WebView2",
+            "TickFlow 股票面板需要 Microsoft Edge WebView2 Runtime。\n\n"
+            f"请安装后重试:\n{_WEBVIEW2_DOWNLOAD}",
+        )
+        return 1
 
     try:
         _ensure_data_dir_writable()
@@ -329,7 +404,8 @@ def main() -> int:
         logger.info("打开桌面窗口: %s", url)
         _open_window(url)
 
-        # 窗口关闭后, 进程退出 (daemon 线程会被回收)
+        _stop_uvicorn()
+        server_thread.join(timeout=8)
         logger.info("窗口已关闭, 桌面版退出")
         return 0
     except KeyboardInterrupt:

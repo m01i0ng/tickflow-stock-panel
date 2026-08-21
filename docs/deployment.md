@@ -69,6 +69,39 @@ docker compose up --build -d
 
 ---
 
+## 方式 C:桌面安装包(Windows / macOS)
+
+无需本机 Python / Node,从 [GitHub Releases](https://github.com/shy3130/tickflow-stock-panel/releases) 下载对应安装包。
+
+### Windows x64
+
+1. 下载 `TickFlowStockPanel-Setup-x64.exe`,双击按向导安装(无需管理员)。默认程序目录优先 D 盘;D 盘不存在或不可写时回退 `%LOCALAPPDATA%\Programs\TickFlowStockPanel`。
+2. **WebView2**:Windows 11 通常已预装;部分 Windows 10 需先安装 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。缺少时启动会弹框并退出。
+3. 安装包未签名,SmartScreen 可能提示,选择「仍要运行」即可。
+
+### macOS Apple Silicon (M 系列)
+
+1. 下载 `TickFlowStockPanel-macos-arm64.dmg`,打开后把 `TickFlowStockPanel` 拖进 Applications。
+2. 未公证。首次启动请 **右键 → 打开**,绕过 Gatekeeper。
+3. Intel Mac 暂不支持(上游 polars 已停止发布 Intel wheel)。
+
+### 数据目录与升级
+
+桌面版数据在用户目录,替换 `.app` / 覆盖安装程序文件都不会丢掉行情、策略、回测和监控记录:
+
+| 平台 | 默认数据目录 |
+| :--- | :--- |
+| Windows | `%LOCALAPPDATA%\TickFlowStockPanel` |
+| macOS | `~/Library/Application Support/TickFlowStockPanel` |
+
+可用环境变量 `DATA_DIR` 覆盖。旧版写在安装目录 `data/` 或 `TickFlowStockPanel_Data/` 的数据,首次启动会自动迁到上述目录。卸载时会询问是否删除用户数据。
+
+不内嵌 Node / Tesseract / Codex / WebView2。stock-sdk 插件在系统已安装 Node 时可降级可用,否则界面显示不可用。从 Finder 启动的 macOS 应用会自动把 `/opt/homebrew/bin` 和 `/usr/local/bin` 加入 `PATH`。
+
+Linux 的 GitHub Actions 产物仍会构建 tar.gz,本轮不以桌面安装包验收。
+
+---
+
 ## 老 CPU 兼容(avx2/fma 缺失)
 
 如果运行时报 `avx2`/`fma` 缺失,或进程 `exit 132`,说明 CPU 不支持 AVX2 指令集(常见于老 VPS)。解决:

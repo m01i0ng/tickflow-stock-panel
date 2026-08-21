@@ -65,6 +65,8 @@ hiddenimports += collect_submodules("polars")
 # ── pywebview 平台后端 (动态导入, PyInstaller 默认抓不到) ────────────
 hiddenimports += collect_submodules("webview")
 hiddenimports += collect_submodules("webview.platforms")
+if sys.platform == "win32":
+    hiddenimports += ["pythonnet", "clr_loader", "clr"]
 
 # ── 系统通知后端 (winotify/plyer 按平台动态导入) ─────────────────────
 if sys.platform == "win32":
@@ -115,6 +117,15 @@ datas += [(FRONTEND_DIST, "static")]
 datas += [(TIERS_YAML, ".")]
 # 内置策略 → app/strategy/builtin/ (importlib 动态加载, 不能进 PYZ)
 datas += [(BUILTIN_STRATEGIES, "app/strategy/builtin")]
+# AI 策略 prompt (.md) → app/strategy/prompts/
+datas += [(str(ROOT / "backend" / "app" / "strategy" / "prompts"), "app/strategy/prompts")]
+# 内置插件 (plugin.yaml + bridge.mjs); 排除 node_modules
+_plugins_src = ROOT / "backend" / "app" / "plugins"
+if _plugins_src.is_dir():
+    for _plugin_file in _plugins_src.rglob("*"):
+        if _plugin_file.is_file() and "node_modules" not in _plugin_file.parts:
+            _rel = _plugin_file.relative_to(_plugins_src)
+            datas.append((str(_plugin_file), str(Path("app/plugins") / _rel.parent)))
 
 # ── 排除不需要的重型依赖 (主包不含 vectorbt 回测链) ──────────────────
 excludes = [
@@ -209,6 +220,10 @@ if _IS_MACOS:
             "CFBundleDisplayName": "TickFlow 股票面板",
             "CFBundleVersion": APP_VERSION,
             "NSHighResolutionCapable": True,
-            "LSMinimumSystemVersion": "10.13",
+            "NSPrincipalClass": "NSApplication",
+            "NSAppTransportSecurity": {
+                "NSAllowsLocalNetworking": True,
+            },
+            "LSMinimumSystemVersion": "12.0",
         },
     )

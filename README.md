@@ -179,6 +179,17 @@ CODEX_CLI_VERSION=0.144.3 docker compose up --build
 
 > 📖 Docker 进阶、GitHub Actions 自构建、老 CPU 兼容、访问密码设置等见 [docs/deployment.md](./docs/deployment.md)。
 
+### 方式 C:桌面安装包(Windows / macOS)
+
+从 [GitHub Releases](https://github.com/shy3130/tickflow-stock-panel/releases) 下载安装包,不装 Python / Node 即可运行。
+
+- **Windows x64**:双击 `TickFlowStockPanel-Setup-x64.exe`(无需管理员)。Win11 已预装 WebView2;部分 Win10 需先装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。未签名,可能被 SmartScreen 拦截,选「仍要运行」。
+- **macOS Apple Silicon**:打开 `TickFlowStockPanel-macos-arm64.dmg`,把应用拖进 Applications。未公证,首次请右键 → 打开。Intel Mac 暂不支持。
+- 数据在用户目录,覆盖安装/升级不丢:Windows `%LOCALAPPDATA%\TickFlowStockPanel`,macOS `~/Library/Application Support/TickFlowStockPanel`。可用环境变量 `DATA_DIR` 覆盖。
+- 不内嵌 Node / Tesseract / WebView2;stock-sdk 等需系统已装 Node 才可用。
+
+详见 [docs/deployment.md](./docs/deployment.md)。
+
 ### 跑起来后的第一次使用
 
 1. **设置 → 凭据与能力** → 点 **重新检测**,确认档位标签

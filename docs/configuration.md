@@ -77,7 +77,17 @@ DATA_DIR=./data       # Parquet / DuckDB 数据存储目录
 
 整个 `data/` 目录都不纳入 git —— 行情 K线、财务、自选、回测、监控记录,乃至概念/行业扩展数据,全部是程序运行时生成/拉取的用户数据。
 
-如需迁移数据,直接拷贝整个 `data/` 目录即可。详见 [deployment.md → 更新代码](./deployment.md#更新代码已部署用户必读)。
+**默认位置:**
+
+| 运行方式 | 默认 `DATA_DIR` |
+| :--- | :--- |
+| Dev / Docker | 项目根目录 `data/`(Docker 中为容器内 `/app/data`) |
+| 桌面版 Windows | `%LOCALAPPDATA%\TickFlowStockPanel` |
+| 桌面版 macOS | `~/Library/Application Support/TickFlowStockPanel` |
+
+桌面版也可通过环境变量或数据目录下的 `.env` 设置 `DATA_DIR` 覆盖。相对路径在打包后不会按程序内部解压目录解析。
+
+如需迁移数据,直接拷贝整个数据目录即可。详见 [deployment.md → 更新代码](./deployment.md#更新代码已部署用户必读) 与 [deployment.md → 方式 C](./deployment.md#方式-c桌面安装包windows--macos)。
 
 ---
 
