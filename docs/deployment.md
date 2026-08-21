@@ -45,7 +45,7 @@ docker compose up --build
 # 打开 http://localhost:3018
 ```
 
-Docker 采用两阶段构建,前端 dist 拷进后端镜像,**单容器**运行,数据完全在自己手里。
+Docker 采用多阶段构建,前端 dist 拷进后端镜像,**单容器**运行,数据完全在自己手里。
 
 > ⚠️ **stock-sdk 插件默认不打包(合规考虑)**
 >
@@ -97,8 +97,6 @@ docker compose up --build -d
 可用环境变量 `DATA_DIR` 覆盖。旧版写在安装目录 `data/` 或 `TickFlowStockPanel_Data/` 的数据,首次启动会自动迁到上述目录。卸载时会询问是否删除用户数据。
 
 不内嵌 Node / Tesseract / Codex / WebView2。stock-sdk 插件在系统已安装 Node 时可降级可用,否则界面显示不可用。从 Finder 启动的 macOS 应用会自动把 `/opt/homebrew/bin` 和 `/usr/local/bin` 加入 `PATH`。
-
-Linux 的 GitHub Actions 产物仍会构建 tar.gz,本轮不以桌面安装包验收。
 
 ---
 

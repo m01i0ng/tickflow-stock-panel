@@ -175,7 +175,7 @@ CODEX_CLI_VERSION=0.144.3 docker compose up --build
 
 > Codex CLI 模式允许 TickFlow 容器读取本机 Codex 登录凭据，仅应在受信任的本机环境启用。凭据目录以只读方式挂载，不会写入镜像。
 
-镜像已内置 **stock-sdk** 数据源插件(Node 运行时 + 依赖),开箱即用。
+镜像默认不打包 **stock-sdk** 数据源插件；如确需启用，请按部署文档显式构建。
 
 > 📖 Docker 进阶、GitHub Actions 自构建、老 CPU 兼容、访问密码设置等见 [docs/deployment.md](./docs/deployment.md)。
 
@@ -224,7 +224,7 @@ PORT=3018                      # 服务端口
 | **数据源**   | [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 官方 SDK · 其他数据源后续迭代实装   |
 | **AI**(可选) | OpenAI 兼容接口(DeepSeek / 通义 / Ollama 等)                                                      |
 | **前端**     | React 18 · Vite · TypeScript · Tailwind · Tanstack Query · Lightweight Charts · ECharts · dnd-kit |
-| **部署**     | Docker 两阶段构建,前端 dist 拷进后端镜像,**单容器**                                               |
+| **部署**     | Docker 多阶段构建,前端 dist 拷进后端镜像,**单容器**                                               |
 
 ---
 

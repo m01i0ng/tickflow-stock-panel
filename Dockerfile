@@ -1,4 +1,4 @@
-# 两阶段构建:前端 dist 拷进后端镜像,单容器运行
+# 多阶段构建:前端 dist 拷进后端镜像,单容器运行
 # 可选:构建网络无法直连官方源时,传入 --build-arg USE_CN_MIRROR=1 启用国内镜像
 # 可选:stock-sdk 插件默认不打包(它抓取第三方财经网站接口,存在版权与反爬风险)。
 #       如确需启用,传入 --build-arg INCLUDE_STOCKSDK=1 显式开启,使用风险自负。
@@ -10,6 +10,7 @@ ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PYPI_FALLBACK=https://mirrors.aliyun.com/pypi/simple
 ARG BACKEND_EXTRAS=
 ARG CODEX_CLI_VERSION=0.144.3
+ARG UV_VERSION=0.12.5
 
 # === Stage 1: 前端构建 ===
 FROM node:20-alpine AS frontend-builder
@@ -20,11 +21,11 @@ WORKDIR /build
 # 因此国内网络下最稳的做法是直接用 npm 安装 pnpm(npm 会读取 .npmrc 镜像源),
 # 彻底绕开 corepack 再次联网下载 pnpm 的问题。
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
-    npm install -g pnpm@9
+    npm install -g pnpm@9.10.0
 # 让 pnpm 走镜像源安装依赖
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then pnpm config set registry "$NPM_REGISTRY"; fi
-COPY frontend/package.json frontend/pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile || pnpm install
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY frontend/ ./
 RUN pnpm build
 
@@ -42,7 +43,7 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then npm config set registry "$NPM_REGISTRY";
 COPY backend/app/plugins/stocksdk/package.json backend/app/plugins/stocksdk/package-lock.json ./
 # INCLUDE_STOCKSDK=1 时安装依赖;=0 时仅建空目录,使最终镜像不含 stock-sdk 依赖
 RUN if [ "$INCLUDE_STOCKSDK" = "1" ]; then \
-      (npm ci || npm install); \
+      npm ci; \
     else \
       mkdir -p /build/node_modules; \
     fi
@@ -69,6 +70,7 @@ ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PYPI_FALLBACK=https://mirrors.aliyun.com/pypi/simple
 ARG BACKEND_EXTRAS=
 ARG INCLUDE_STOCKSDK=0
+ARG UV_VERSION
 WORKDIR /app
 
 # Node.js 运行时: 仅在启用 stock-sdk 插件时安装(供 node bridge.mjs 使用)。
@@ -86,22 +88,17 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && tesseract --version
 
-# 安装 uv(快) —— 国内镜像下三重兜底:主源 → 备用源 → 官方源,
-# 任一成功即可,避免单一镜像同步延迟/故障导致构建失败。
-# uv 发版极频繁,国内镜像同步存在时间窗口,不锁版本且无 fallback 时
-# 容易遇到 "from versions: none"(索引解析不到最新版)。
+# 安装固定版本 uv；国内镜像下按主源 → 备用源 → 官方源重试。
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
-      pip install --no-cache-dir uv -i "$PYPI_INDEX" || \
-      pip install --no-cache-dir uv -i "$PYPI_FALLBACK" || \
-      pip install --no-cache-dir uv; \
+      pip install --no-cache-dir "uv==$UV_VERSION" -i "$PYPI_INDEX" || \
+      pip install --no-cache-dir "uv==$UV_VERSION" -i "$PYPI_FALLBACK" || \
+      pip install --no-cache-dir "uv==$UV_VERSION"; \
     else \
-      pip install --no-cache-dir uv; \
+      pip install --no-cache-dir "uv==$UV_VERSION"; \
     fi
 
-# Backend deps
-# hatchling 禁止 ../README.md; 本文件与 pyproject 同目录, uv sync 才能过。
-COPY README.md ./README.md
-COPY backend/pyproject.toml backend/uv.lock* ./
+# Backend deps：这里只安装锁定依赖，不在源码 COPY 前构建一个空项目。
+COPY backend/pyproject.toml backend/uv.lock ./
 # uv 原生支持同时挂多个 index(主源 + 备用源),会自动在两源中查找,
 # 比逐个重试更稳健 —— 任一源缺包时另一源补位。
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
@@ -111,7 +108,7 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
     for extra in $BACKEND_EXTRAS; do \
       set -- "$@" --extra "$extra"; \
     done; \
-    uv sync --frozen "$@" || uv sync "$@"
+    uv sync --frozen --no-install-project "$@"
 
 # Backend code
 # 注意:Docker 里 WORKDIR=/app, 而 config.py 的 _PROJECT_ROOT 是按开发布局
@@ -140,4 +137,6 @@ ENV PYTHONPATH=/app
 # 此处让日志时间戳等其余 naive 时间也对齐北京时间。
 ENV TZ=Asia/Shanghai
 EXPOSE 3018
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3018"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3018/health', timeout=3)"]
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3018"]

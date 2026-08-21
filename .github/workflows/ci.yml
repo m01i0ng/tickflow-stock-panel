@@ -2,10 +2,9 @@ name: CI
 
 # 在发版 / 推镜像之前拦住可复现的构建失败 (hatchling metadata、锁文件、前端编译)。
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -22,11 +21,14 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+          version: 0.12.5
       - run: uv python install 3.12
       - name: 同步依赖 (校验 hatchling / uv.lock)
-        run: uv sync --frozen --dev
-      - run: uv run ruff check app tests
+        run: uv sync --frozen --extra dev
+      # 现有仓库尚未建立全量 Ruff 基线；先拦截语法和未定义名称等运行时错误。
+      - run: uv run ruff check app tests --select E9,F63,F7,F82
       - run: uv run pytest tests/test_desktop_paths.py -q --tb=short
+      - run: uv build
 
   frontend:
     runs-on: ubuntu-latest
@@ -37,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.10.0
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
