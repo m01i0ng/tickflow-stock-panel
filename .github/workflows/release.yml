@@ -19,11 +19,10 @@ on:
       version:
         description: '版本号 (必须与 frontend/package.json 一致, 如 v0.1.88)'
         required: true
-        default: 'v0.1.88'
       platforms:
-        description: '要构建的平台 (逗号分隔: windows,macos,linux)'
+        description: '要构建的平台 (逗号分隔: windows,macos)'
         required: true
-        default: 'windows'
+        default: 'windows,macos'
       prerelease:
         description: '是否为预发布 (勾选则标记为 Pre-release)'
         type: boolean
@@ -33,7 +32,11 @@ permissions:
   contents: write   # 创建 Release 需要写权限
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   prepare:
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
@@ -44,7 +47,7 @@ jobs:
         env:
           REQUESTED: ${{ github.event.inputs.platforms }}
           VERSION: ${{ github.event.inputs.version }}
-          ALL: '[{"os":"windows-latest","artifact":"TickFlowStockPanel-Setup-x64.exe","platform":"windows"},{"os":"macos-26","artifact":"TickFlowStockPanel-macos-arm64.dmg","platform":"macos","arch":"arm64"},{"os":"ubuntu-latest","artifact":"TickFlowStockPanel-linux-x64.tar.gz","platform":"linux"}]'
+          ALL: '[{"os":"windows-latest","artifact":"TickFlowStockPanel-Setup-x64.exe","platform":"windows"},{"os":"macos-26","artifact":"TickFlowStockPanel-macos-arm64.dmg","platform":"macos","arch":"arm64"}]'
         run: |
           python3 <<'PY'
           import json, os, pathlib, sys
@@ -54,16 +57,16 @@ jobs:
           known = {p["platform"] for p in all_platforms}
           unknown = [r for r in requested if r not in known]
           if unknown:
-              print(f"未知平台: {unknown}。可用: windows,macos,linux", file=sys.stderr)
+              print(f"未知平台: {unknown}。可用: windows,macos", file=sys.stderr)
               sys.exit(1)
           selected = [p for p in all_platforms if p["platform"] in requested]
           if not selected:
               print("未选中任何平台。platforms 例如: windows 或 windows,macos", file=sys.stderr)
               sys.exit(1)
 
-          pkg_ver = json.loads(pathlib.Path("frontend/package.json").read_text(encoding="utf-8"))["version"].lstrip("v")
-          input_ver = os.environ["VERSION"].lstrip("v")
-          if pkg_ver != input_ver:
+          pkg_ver = json.loads(pathlib.Path("frontend/package.json").read_text(encoding="utf-8"))["version"]
+          input_ver = os.environ["VERSION"]
+          if input_ver != f"v{pkg_ver}":
               print(
                   f"version 输入 {os.environ['VERSION']!r} 与 frontend/package.json {pkg_ver!r} 不一致",
                   file=sys.stderr,
@@ -92,7 +95,7 @@ jobs:
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.10.0
 
       - name: 设置 Node 20
         uses: actions/setup-node@v4
@@ -111,6 +114,7 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+          version: 0.12.5
 
       - name: 设置 Python
         run: uv python install 3.12
@@ -119,11 +123,11 @@ jobs:
         working-directory: backend
         # --no-dev 排除 pytest/ruff/mypy; --extra desktop 装 pywebview
         # --extra legacy-cpu 装 polars[rtcompat] 运行时兼容内核
-        run: uv sync --no-dev --extra desktop --extra legacy-cpu
+        run: uv sync --frozen --no-dev --extra desktop --extra legacy-cpu
 
-      - name: 安装 PyInstaller
+      - name: 安装固定版本 PyInstaller
         working-directory: backend
-        run: uv pip install pyinstaller
+        run: uv pip install pyinstaller==6.22.2
 
       - name: 生成 macOS 图标 (仅 macOS)
         if: matrix.platform == 'macos'
@@ -187,12 +191,6 @@ jobs:
             "${{ matrix.artifact }}" \
             "$STAGE"
 
-      - name: 压缩产物 (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          cd backend/dist
-          tar -czf ../../${{ matrix.artifact }} TickFlowStockPanel
-
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
@@ -202,7 +200,6 @@ jobs:
 
   publish:
     needs: [prepare, build]
-    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: 下载构建产物
@@ -232,7 +229,6 @@ jobs:
           catalog = [
               ("TickFlowStockPanel-Setup-x64.exe", "Windows x64", "windows"),
               ("TickFlowStockPanel-macos-arm64.dmg", "macOS (Apple Silicon / M 系列芯片)", "macos"),
-              ("TickFlowStockPanel-linux-x64.tar.gz", "Linux", "linux"),
           ]
           rows = []
           present = set()
@@ -254,9 +250,6 @@ jobs:
                   "- **macOS**: 打开 dmg, 将 TickFlowStockPanel 拖入 Applications; "
                   "未公证, 首次请右键→打开。仅 Apple Silicon。"
               )
-          if "linux" in present:
-              notes.append("- **Linux**: 解压后运行可执行文件; 需系统 WebKitGTK。")
-
           body = "\n".join([
               f"## 桌面客户端 {version}",
               "",
