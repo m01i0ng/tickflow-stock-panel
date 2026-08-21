@@ -15,7 +15,7 @@ function findVerticalScrollParent(element: HTMLElement | null): HTMLElement | nu
 }
 
 export function useParentScroll(
-  containerRef: RefObject<HTMLElement>,
+  containerRef: RefObject<HTMLElement | null>,
   enabled: boolean,
 ) {
   const [scrollMargin, setScrollMargin] = useState(0)

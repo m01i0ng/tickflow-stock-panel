@@ -55,7 +55,7 @@ function renderExtInline(
   const sep = col.extDisplay?.separator?.trim() || null
   const tags = sep
     ? str.split(sep).map(s => s.trim()).filter(Boolean)
-    : str.split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
+    : str.split(/[、,，;；-]/).map(s => s.trim()).filter(Boolean)
   if (tags.length === 0) return <span className="text-muted">—</span>
   // maxTags 截断 + 展开交互：收起时显示前 N 个 + +N，展开时显示全部 + 收起
   const maxTags = col.extDisplay?.maxTags ?? 0

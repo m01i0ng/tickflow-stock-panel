@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -16,10 +17,10 @@ export default defineConfig({
       // dev 时 /api 转发到 FastAPI
       '/api': {
         target: 'http://localhost:3018',
-        // SSE 端点需要禁用缓冲
+        // SSE 端点需禁用缓冲、声明流式 Accept
         configure: (proxy) => {
           proxy.on('proxyReq', (_proxyReq, req) => {
-            if (req.url?.includes('/stream')) {
+            if (req.url?.includes('/stream') || req.url?.includes('/analyze')) {
               _proxyReq.setHeader('Accept', 'text/event-stream')
               _proxyReq.setHeader('Cache-Control', 'no-cache')
               _proxyReq.setHeader('Connection', 'keep-alive')
@@ -40,7 +41,6 @@ export default defineConfig({
         manualChunks(id) {
           if (id.includes('node_modules')) {
             if (id.includes('echarts')) return 'echarts'
-            if (id.includes('lightweight-charts')) return 'lightweight-charts'
           }
         },
       },

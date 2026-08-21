@@ -109,7 +109,7 @@ function getExtTags(stock: LimitLadderStock, item?: ExtFieldItem): string[] {
   const sep = cfg?.separator?.trim() || null
   const tags = sep
     ? str.split(sep).map(s => s.trim()).filter(Boolean)
-    : str.split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
+    : str.split(/[、,，;；-]/).map(s => s.trim()).filter(Boolean)
 
   const maxTags = cfg?.maxTags ?? 0
   const sliced = maxTags > 0 ? tags.slice(0, maxTags) : tags

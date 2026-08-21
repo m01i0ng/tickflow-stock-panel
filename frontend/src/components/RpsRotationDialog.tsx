@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
+import { useState, useMemo, useRef, useEffect, useCallback, type ReactElement } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { X, Repeat, Sparkles, ArrowDownUp, RefreshCw, AlertCircle } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
@@ -153,7 +153,7 @@ export function RpsRotationDialog({ onClose, kind = 'concept' }: Props) {
   }, [selected, dates, columns])
 
   const renderRows = useMemo(() => {
-    const rows: JSX.Element[] = []
+    const rows: ReactElement[] = []
     for (let displayIdx = visibleRange.start; displayIdx < visibleRange.end; displayIdx++) {
       const rawIdx = getRowIndex(displayIdx)
       const cells = dates.map((d) => {

@@ -60,6 +60,17 @@ Docker 采用多阶段构建,前端 dist 拷进后端镜像,**单容器**运行,
 > - 启用后镜像会额外内置 Node.js 运行时并预装 stock-sdk 依赖,插件开箱即用。
 > - **建议优先使用 TickFlow 等正规授权数据源。**
 
+镜像以**非 root 用户 (UID 1000)** 运行。Linux 主机上 `data/` 卷的属主需与之一致,
+否则面板无法写入行情/设置 (Docker 新建的挂载目录默认属主为 root, 全新部署与旧版升级都需执行一次):
+
+```bash
+sudo mkdir -p data && sudo chown -R 1000:1000 data
+docker compose up --build -d
+```
+
+macOS / Windows(Docker Desktop)不校验挂载属主,无需处理。自选截图 OCR 功能默认保留;
+镜像瘦身可关闭构建:`docker compose build --build-arg INCLUDE_OCR=0`(关闭后面板内截图导入不可用)。
+
 更新到新版本:
 
 ```bash

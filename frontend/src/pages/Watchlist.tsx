@@ -103,7 +103,7 @@ function renderExtValue(
   const separator = cfg?.separator?.trim() || null
   const tags = separator
     ? str.split(separator).map(s => s.trim()).filter(Boolean)
-    : str.split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
+    : str.split(/[、,，;；-]/).map(s => s.trim()).filter(Boolean)
 
   if (tags.length === 0) return <span className="text-muted">—</span>
 

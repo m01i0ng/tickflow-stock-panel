@@ -11,6 +11,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 版本号一致性守卫: VERSION / pyproject / __init__ / package.json 四处必须一致,
+  # 防止发版时静默漂移 (release.yml 以 frontend/package.json 为准)。
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验四处版本号一致
+        run: python3 scripts/check_versions.py
+
   backend:
     runs-on: ubuntu-latest
     defaults:
@@ -25,9 +34,13 @@ jobs:
       - run: uv python install 3.12
       - name: 同步依赖 (校验 hatchling / uv.lock)
         run: uv sync --frozen --extra dev
-      # 现有仓库尚未建立全量 Ruff 基线；先拦截语法和未定义名称等运行时错误。
-      - run: uv run ruff check app tests --select E9,F63,F7,F82
-      - run: uv run pytest tests/test_desktop_paths.py -q --tb=short
+      # 全量规则集: tests/ 已有完整基线, 直接全量拦截;
+      # app/ 存量告警尚在收敛中, 先只拦语法/未定义名称等运行时错误, 不放大存量噪音。
+      - run: uv run ruff check app tests ../scripts/check_versions.py --select E9,F63,F7,F82
+      - name: Ruff 全量规则 (tests/ + scripts/)
+        run: uv run ruff check tests ../scripts/check_versions.py
+      - name: 全量测试 (620+, 含回测/缠论/AI/数据源契约)
+        run: uv run pytest tests -q --tb=short
       - run: uv build
 
   frontend:
@@ -46,4 +59,9 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - name: 类型检查 + 生产构建 (tsc -b && vite build)
+        run: pnpm build
+      - name: ESLint (0 error 门槛, 存量 any/exhaustive-deps 以 warning 跟踪)
+        run: pnpm lint
+      - name: "Vitest (lib 层约束: SSE 解析 / queryKeys)"
+        run: pnpm test

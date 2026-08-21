@@ -219,7 +219,7 @@
 | 策略或监控 | 参数变更、缓存失效、资产切换、重启/并发相关路径 |
 | 回测 | 信号日与成交日、T+1、费用、滑点、不可成交、数据缺口 |
 | 缓存或性能 | 命中/失效测试、并发快照测试；必要时提供前后基准 |
-| 前端组件或页面 | `pnpm build`，并手工检查加载、空、错、切换和实时刷新状态 |
+| 前端组件或页面 | `pnpm build` + `pnpm lint` + `pnpm test`，并手工检查加载、空、错、切换和实时刷新状态 |
 | 前后端契约同时变化 | 后端定向测试 + 前端构建 + 对应页面联调 |
 | 文件、Docker 或跨平台逻辑 | 正常路径、权限/能力缺失和目标不可用的失败路径 |
 
@@ -232,6 +232,10 @@ uv run ruff check app/path.py tests/path.py
 
 cd frontend
 pnpm build
+pnpm lint   # ESLint: error 为准入门槛, 存量 any/exhaustive-deps 以 warning 跟踪
+pnpm test   # Vitest: lib 层契约测试 (SSE 解析 / queryKeys)
+
+python3 scripts/check_versions.py   # 版本号四处一致性 (CI 门槛)
 
 git diff --check
 ```

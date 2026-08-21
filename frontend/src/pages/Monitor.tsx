@@ -69,7 +69,7 @@ function getExtTags(ev: Record<string, unknown>, item: MonitorExtFieldItem | nul
   if (v == null) return []
   const str = String(v)
   if (!str) return []
-  let tags = str.split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
+  let tags = str.split(/[、,，;；-]/).map(s => s.trim()).filter(Boolean)
   const maxTags = item.maxTags ?? 0
   if (maxTags > 0) tags = tags.slice(0, maxTags)
   const hidden = item.hiddenIndices

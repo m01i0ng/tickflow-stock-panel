@@ -77,7 +77,7 @@ export function useQuoteStream(
 ) {
   const qc = useQueryClient()
   const esRef = useRef<EventSource | null>(null)
-  const retryRef = useRef<ReturnType<typeof setTimeout>>()
+  const retryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const pagesRef = useRef(sseRefreshPages)
   pagesRef.current = sseRefreshPages
 

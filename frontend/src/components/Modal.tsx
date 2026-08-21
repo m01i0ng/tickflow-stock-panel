@@ -23,7 +23,7 @@ export interface ModalProps {
   /** 遮罩 className (覆盖默认居中/背景) */
   overlayClassName?: string
   /** 打开时聚焦的元素; 不传则聚焦面板内首个可聚焦元素 */
-  initialFocusRef?: React.RefObject<HTMLElement>
+  initialFocusRef?: React.RefObject<HTMLElement | null>
   /** 点击遮罩是否关闭 (默认 true) */
   closeOnBackdrop?: boolean
 }

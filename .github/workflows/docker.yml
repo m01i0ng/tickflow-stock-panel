@@ -8,6 +8,16 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # 文档/截图/元数据改动不进入镜像, 跳过构建; tag 触发不受路径过滤影响
+    paths-ignore:
+      - 'docs/**'
+      - 'screenshots/**'
+      - '.github/**'
+      - '**.md'
+      - 'LICENSE'
+      - 'community-qr-code.jpg'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
   workflow_dispatch:
 
 env:

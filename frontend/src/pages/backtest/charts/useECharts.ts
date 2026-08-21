@@ -12,7 +12,7 @@ import type { ECharts, EChartsOption } from 'echarts'
 export function useECharts(
   option: EChartsOption | null,
   deps: any[] = [],
-  containerRef?: React.RefObject<HTMLDivElement>,
+  containerRef?: React.RefObject<HTMLDivElement | null>,
 ) {
   const ownRef = useRef<HTMLDivElement>(null)
   const chartRef = containerRef ?? ownRef

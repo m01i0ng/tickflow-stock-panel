@@ -140,7 +140,7 @@ function renderExtValue(
   const separator = cfg?.separator?.trim() || null
   const tags = separator
     ? str.split(separator).map(s => s.trim()).filter(Boolean)
-    : str.split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
+    : str.split(/[、,，;；-]/).map(s => s.trim()).filter(Boolean)
 
   return renderTagList(tags, col, expanded, onToggle, EXT_TAG_CLS, onTagClick)
 }

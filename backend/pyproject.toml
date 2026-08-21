@@ -73,7 +73,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
-    "mypy>=1.10",
 ]
 
 [build-system]
@@ -89,7 +88,11 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
-ignore = ["E501"]   # 长行交给 fmt
+ignore = [
+    "E501",     # 长行交给 fmt
+    # 代码注释/文案为中文, 中文标点(，：（）×)是刻意的可读性选择, 非半角误用
+    "RUF001", "RUF002", "RUF003",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

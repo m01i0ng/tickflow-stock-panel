@@ -4,6 +4,8 @@
 #       如确需启用,传入 --build-arg INCLUDE_STOCKSDK=1 显式开启,使用风险自负。
 ARG USE_CN_MIRROR=1
 ARG INCLUDE_STOCKSDK=0
+# 自选截图 OCR 是边缘功能: 默认仍安装保持兼容, 镜像瘦身可传 --build-arg INCLUDE_OCR=0
+ARG INCLUDE_OCR=1
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 # 备用 PyPI 源:主源同步延迟/故障时自动兜底(阿里云与清华互为补充)
@@ -25,7 +27,9 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then npm config set registry "$NPM_REGISTRY";
 # 让 pnpm 走镜像源安装依赖
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then pnpm config set registry "$NPM_REGISTRY"; fi
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+# pnpm store 缓存挂载: 锁文件不变时重复构建直接复用 (cache 层可被 GC, 不依赖镜像层缓存)
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
 COPY frontend/ ./
 RUN pnpm build
 
@@ -64,12 +68,13 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then npm config set registry "$NPM_REGISTRY";
     && /opt/codex-native --version
 
 # === Stage 2: Python 运行时 ===
-FROM python:3.11-slim AS runtime
+FROM python:3.12-slim AS runtime
 ARG USE_CN_MIRROR=1
 ARG PYPI_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PYPI_FALLBACK=https://mirrors.aliyun.com/pypi/simple
 ARG BACKEND_EXTRAS=
 ARG INCLUDE_STOCKSDK=0
+ARG INCLUDE_OCR=1
 ARG UV_VERSION
 WORKDIR /app
 
@@ -78,15 +83,17 @@ WORKDIR /app
 # bookworm 自带 nodejs 18.19, 满足插件 engines>=18; --no-install-recommends 精简,
 # 自带 libnode/libc-ares 等全部动态依赖, 无需手动补库。
 # 国内构建走 apt mirror 已在 debian 镜像sources.list 配好, 无需额外换源。
-# tesseract-ocr: 自选截图导入（始终安装）; nodejs: 仅 INCLUDE_STOCKSDK=1 时安装
+# tesseract-ocr: 自选截图导入 INCLUDE_OCR=1(默认) 时安装; nodejs: 仅 INCLUDE_STOCKSDK=1 时安装
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
+    && if [ "$INCLUDE_OCR" = "1" ]; then \
+         apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
+         && tesseract --version; \
+       fi \
     && if [ "$INCLUDE_STOCKSDK" = "1" ]; then \
          apt-get install -y --no-install-recommends nodejs \
          && node --version; \
        fi \
-    && rm -rf /var/lib/apt/lists/* \
-    && tesseract --version
+    && rm -rf /var/lib/apt/lists/*
 
 # 安装固定版本 uv；国内镜像下按主源 → 备用源 → 官方源重试。
 RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
@@ -101,7 +108,9 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
 COPY backend/pyproject.toml backend/uv.lock ./
 # uv 原生支持同时挂多个 index(主源 + 备用源),会自动在两源中查找,
 # 比逐个重试更稳健 —— 任一源缺包时另一源补位。
-RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
+# uv 全局缓存挂载: 锁文件不变时重复构建直接复用已下载的 wheel。
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$USE_CN_MIRROR" = "1" ]; then \
       export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; \
     fi; \
     set -- --no-dev; \
@@ -131,6 +140,13 @@ COPY --from=frontend-builder /build/dist ./static
 # Codex CLI 使用官方 npm 包携带的当前平台原生二进制，无需运行时 Node.js。
 COPY --from=codex-builder /opt/codex-native /usr/local/bin/codex
 RUN codex --version
+
+# 非 root 运行 (UID 1000 与常见主机首个用户一致)。
+# 注意: Linux 主机上 ./data 挂载卷的属主必须是 1000 (见 docs/deployment.md 迁移说明);
+# macOS (osxfs) 不校验属主, 无影响。
+RUN useradd --create-home --uid 1000 --gid 1000 tickflow \
+    && chown -R tickflow:tickflow /app
+USER tickflow
 
 ENV PYTHONPATH=/app
 # 兜底时区: 交易时段判断已在代码里显式用北京时间 (app/market_time.py),

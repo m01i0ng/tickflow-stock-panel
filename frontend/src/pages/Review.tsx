@@ -613,7 +613,7 @@ function ReportPanel({
   onCopy: () => void
   onDownload: () => void
   onRegenerate: () => void
-  reportEndRef: React.RefObject<HTMLDivElement>
+  reportEndRef: React.RefObject<HTMLDivElement | null>
 }) {
   if (phase === 'error') {
     return (

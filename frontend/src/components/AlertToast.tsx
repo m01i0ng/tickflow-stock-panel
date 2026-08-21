@@ -224,7 +224,7 @@ export function AlertToastContainer() {
                   const key = item.field.replace('.', '__')
                   const v = (ev as Record<string, unknown>)[key]
                   if (v == null) continue
-                  let parts = String(v).split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
+                  let parts = String(v).split(/[、,，;；-]/).map(s => s.trim()).filter(Boolean)
                   const mt = item.maxTags ?? 0
                   if (mt > 0) parts = parts.slice(0, mt)
                   const hi = item.hiddenIndices

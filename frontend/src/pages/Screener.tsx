@@ -971,7 +971,7 @@ export function Screener() {
             setSettingsStrategyId(null)
             setBuilderMode('modify')
             setShowBuilder(true)
-          } catch {}
+          } catch { /* 已由 request 层 toast */ }
         }}
         onDeleted={() => {
           if (settingsStrategyId) {

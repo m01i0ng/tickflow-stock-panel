@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["on the first day of the month"],
+  "timezone": "Asia/Shanghai",
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["pep621", "uv"],
+      "groupName": "python 依赖"
+    },
+    {
+      "matchManagers": ["npm"],
+      "groupName": "前端依赖"
+    },
+    {
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "groupName": "Docker 依赖"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "groupName": "大版本升级(需人工确认)",
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

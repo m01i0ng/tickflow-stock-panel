@@ -70,6 +70,12 @@ backend/user_prompts/
 # ===== TypeScript build cache =====
 frontend/tsconfig*.tsbuildinfo
 
+# tsc -b 由 vite.config.ts / vitest.config.ts 生成的编译产物 (源文件在库中, 产物不入库)
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/vitest.config.js
+frontend/vitest.config.d.ts
+
 # ===== Data files =====
 *.xlsx
 
