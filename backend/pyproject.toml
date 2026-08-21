@@ -62,6 +62,13 @@ desktop = [
     "pywebview>=5.0",
 ]
 
+# 缠论多级别分析 (czsc)。可选依赖 + 懒加载: 未安装时 /api/chan 返回未启用状态,
+# 主流程不受影响。使用 pandas 的第二处边界 (见 CONTRIBUTING.md §6.4)。
+# 启用:`uv sync --extra chan`
+chan = [
+    "czsc>=1.0.1,<2",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

@@ -39,7 +39,7 @@
 ### 2.1 技术栈
 
 - 后端：Python 3.11+、FastAPI、Pydantic v2、Polars、DuckDB、PyArrow。
-- 回测边界允许使用 pandas；业务数据计算优先使用 Polars。`vectorbt` 是可选依赖，不得让未安装它的主流程失效。
+- 回测边界与缠论分析边界允许使用 pandas；业务数据计算优先使用 Polars。`vectorbt` 与 `czsc`（`chan` extra）是可选依赖，不得让未安装它们的主流程失效。
 - 前端：React 18、TypeScript、Vite、TanStack Query、Tailwind CSS、ECharts、lightweight-charts。
 - 包管理和验证命令：后端使用 `uv`，前端使用 `pnpm`。
 

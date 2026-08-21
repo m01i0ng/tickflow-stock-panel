@@ -7,6 +7,7 @@ import { QK } from '@/lib/queryKeys'
 import { useCapabilities } from '@/lib/useSharedQueries'
 import { EChartsCandlestick, type OHLC } from '@/components/EChartsCandlestick'
 import { EChartsIntraday } from '@/components/EChartsIntraday'
+import { ChanPanel } from '@/components/stock-analysis/ChanPanel'
 
 function defaultRange() {
   const now = new Date()
@@ -149,6 +150,15 @@ export function Indices() {
     },
   })
 
+  const syncMinute = useMutation({
+    mutationFn: () => api.chanSyncMinute(selectedSymbol),
+    onSuccess: () => {
+      // 缠论面板按 symbol+级别缓存, 同步后整体失效重算; 分时图按日期缓存一并失效
+      qc.invalidateQueries({ queryKey: ['chan-analysis', selectedSymbol] })
+      qc.invalidateQueries({ queryKey: ['index-minute', selectedSymbol] })
+    },
+  })
+
   const quoteBySymbol = useMemo(() => {
     const m = new Map<string, any>()
     for (const q of quotes.data?.rows ?? []) m.set(q.symbol, q)
@@ -227,6 +237,17 @@ export function Indices() {
             {syncDaily.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
             同步指数日K
           </button>
+          {hasMinuteCap && selectedSymbol && (
+            <button
+              onClick={() => syncMinute.mutate()}
+              disabled={syncMinute.isPending}
+              title="同步所选指数 1m 分钟K（TickFlow 单次上限；点击缠论分钟级别无数据时也会自动同步）"
+              className="inline-flex items-center gap-1.5 rounded-btn bg-elevated px-3 py-1.5 text-xs text-secondary hover:text-foreground disabled:opacity-50"
+            >
+              {syncMinute.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              同步指数分钟
+            </button>
+          )}
         </div>
       </div>
 
@@ -341,6 +362,9 @@ export function Indices() {
                 )}
               </div>
             </div>
+          )}
+          {chartRows.length > 0 && (
+            <ChanPanel symbol={selectedSymbol} height={380} start={range.start} end={range.end} />
           )}
         </main>
       </div>

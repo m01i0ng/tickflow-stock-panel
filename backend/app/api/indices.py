@@ -147,3 +147,18 @@ def sync_index_daily(
     count = index_sync.sync_index_instruments(repo)
     rows = index_sync.sync_and_persist_index_daily(repo, capset, start_date=start, end_date=end)
     return {"status": "ok", "index_count": count, "rows_written": rows}
+
+
+@router.post("/sync_minute")
+def sync_index_minute(
+    request: Request,
+    symbol: str = Query(..., min_length=1, max_length=20, description="指数代码, 如 000001.SH"),
+    days: int = Query(60, ge=1, le=60, description="回溯自然日范围 (10000 根/请求 ≈ 41 交易日)"),
+):
+    """同步单只指数分钟K到 kline_index_minute (限额节奏, 幂等合并)。"""
+    repo = request.app.state.repo
+    capset = request.app.state.capabilities
+    if not capset.has(Cap.KLINE_MINUTE_BATCH):
+        raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (minute K-line)")
+    rows = index_sync.sync_and_persist_index_minute(repo, capset, symbols=[symbol.strip()], days=days)
+    return {"status": "ok", "symbol": symbol, "rows_written": rows}

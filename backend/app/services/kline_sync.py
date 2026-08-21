@@ -439,6 +439,43 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
 
 # ===== 分钟 K 同步 =====
 
+# TickFlow klines.get/batch count 上限。SDK 文档写明 "max 10000",
+# 由 tests/test_chan_minute_sync.py::test_tickflow_kline_count_max_from_sdk_docs 锁定。
+TICKFLOW_KLINE_COUNT_MAX = 10000
+# A 股 1m: 09:30-11:29 + 13:00-14:59 = 240 根/交易日。
+A_SHARE_MINUTE_BARS_PER_DAY = 240
+
+# TickFlow Period 字面量 (generated_model.Period)。120分钟不在列表内, 需从 60分钟合成。
+TICKFLOW_CHAN_PERIODS: dict[str, str] = {
+    "日线": "1d",
+    "1分钟": "1m",
+    "5分钟": "5m",
+    "10分钟": "10m",
+    "15分钟": "15m",
+    "30分钟": "30m",
+    "60分钟": "60m",
+}
+_CHAN_MINUTE_ORDER = ("1分钟", "5分钟", "10分钟", "15分钟", "30分钟", "60分钟", "120分钟")
+
+
+def tickflow_period_for_chan_freq(freq: str) -> str | None:
+    """缠论级别 → TickFlow period; 不支持时返回 None。"""
+    return TICKFLOW_CHAN_PERIODS.get(freq)
+
+
+def chan_synth_parent(freq: str) -> str | None:
+    """TickFlow 无该级别时, 用更细的上一级合成 (120分钟 ← 60分钟)。"""
+    if freq not in _CHAN_MINUTE_ORDER:
+        return None
+    idx = _CHAN_MINUTE_ORDER.index(freq)
+    return _CHAN_MINUTE_ORDER[idx - 1] if idx > 0 else None
+
+_MINUTE_DIR = {
+    "stock": "kline_minute",
+    "etf": "kline_etf_minute",
+    "index": "kline_index_minute",
+}
+
 CANONICAL_MINUTE_COLS = [
     "symbol", "datetime", "open", "high", "low", "close", "volume", "amount",
 ]
@@ -529,6 +566,11 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
     return written
 
 
+def write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
+    """公开入口: 指数/ETF 分钟落盘复用同一分区合并语义 (见 _write_minute_partition)。"""
+    return _write_minute_partition(df, minute_dir)
+
+
 def _resolve_minute_provider(
     provider_name: str,
 ) -> tuple[object | None, bool, str | None]:
@@ -555,6 +597,110 @@ def _resolve_minute_provider(
         return (provider, False, None)
     except Exception as e:  # noqa: BLE001
         return (None, True, str(e))
+
+
+def tickflow_minute_max_calendar_days() -> int:
+    """单次 count 上限对应的自然日回溯。
+
+    10000 根 / 240 根/交易日 = 41 交易日; 自然日 = floor(41 * 7/5) = 57,
+    换算回 1m 根数约 9771, 落在单次请求上限内。
+    """
+    trading = TICKFLOW_KLINE_COUNT_MAX // A_SHARE_MINUTE_BARS_PER_DAY
+    return max(1, int(trading * 7 / 5))
+
+
+def _minute_sync_allowed(capset: CapabilitySet) -> bool:
+    if capset.has(Cap.KLINE_MINUTE_BATCH):
+        return True
+    provider = preferences.get_minute_data_provider()
+    _, fallback, _ = _resolve_minute_provider(provider)
+    return not fallback
+
+
+def ensure_symbol_minute_for_chan(
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    symbol: str,
+) -> dict[str, object]:
+    """缠论分钟级: 本地无可用 1m 时按 TickFlow count 上限同步指数。
+
+    仅指数 (kline_index_minute)。全窗口拉取, 不吃全局 max datetime 做增量。
+    """
+    symbol = (symbol or "").strip()
+    empty = {
+        "symbol": symbol,
+        "asset_type": "",
+        "rows_written": 0,
+        "skipped": False,
+        "count_max": TICKFLOW_KLINE_COUNT_MAX,
+        "reason": "",
+    }
+    if not symbol:
+        return {**empty, "status": "error", "reason": "symbol 不能为空"}
+    asset_type = repo.resolve_asset_type(symbol)
+    if asset_type != "index":
+        return {**empty, "status": "error", "asset_type": asset_type, "reason": "缠论分钟同步仅支持指数"}
+    if not _minute_sync_allowed(capset):
+        return {**empty, "status": "forbidden", "reason": "需要分钟K权限"}
+
+    days = tickflow_minute_max_calendar_days()
+    end = date.today()
+    start = end - timedelta(days=days)
+    existing = repo.get_minute_range([symbol], start, end, asset_type=asset_type)
+    if existing.height >= A_SHARE_MINUTE_BARS_PER_DAY:
+        return {
+            "status": "skipped",
+            "symbol": symbol,
+            "asset_type": asset_type,
+            "rows_written": 0,
+            "skipped": True,
+            "count_max": TICKFLOW_KLINE_COUNT_MAX,
+            "reason": "本地已有可用 1m 分钟K",
+        }
+
+    now = datetime.now()
+    minute_dir = repo.store.data_dir / _MINUTE_DIR[asset_type]
+    written_box = [0]
+
+    def _persist(seg_df: pl.DataFrame) -> None:
+        written_box[0] += _write_minute_partition(seg_df, minute_dir)
+
+    limit = resolve_limit(
+        capset,
+        Cap.KLINE_MINUTE_BATCH,
+        default_batch=50,
+        default_rpm=30,
+        default_rpm_when_unset=False,
+    )
+    sync_minute_batch(
+        [symbol],
+        start_time=now - timedelta(days=days),
+        end_time=now,
+        count=TICKFLOW_KLINE_COUNT_MAX,
+        batch_size=limit.batch,
+        rpm=limit.rpm,
+        segment_trading_days=TICKFLOW_KLINE_COUNT_MAX // A_SHARE_MINUTE_BARS_PER_DAY,
+        on_segment=_persist,
+        asset_type=asset_type,
+    )
+
+    if written_box[0]:
+        from app.jobs.daily_pipeline import _refresh_single_view
+        _refresh_single_view(repo, _MINUTE_DIR[asset_type])
+        logger.info(
+            "chan minute synced: %s %s rows=%d count_max=%d days=%d",
+            asset_type, symbol, written_box[0], TICKFLOW_KLINE_COUNT_MAX, days,
+        )
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "asset_type": asset_type,
+        "rows_written": written_box[0],
+        "skipped": False,
+        "count_max": TICKFLOW_KLINE_COUNT_MAX,
+        "reason": "",
+    }
 
 
 def _try_custom_minute(
@@ -824,6 +970,50 @@ def fetch_intraday_monitor_batch(
         logger.warning("intraday monitor fetch failed (%s, %d symbols): %s", source, len(symbols), e)
         return pl.DataFrame()
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+def fetch_index_period(
+    symbol: str,
+    period: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    count: int = TICKFLOW_KLINE_COUNT_MAX,
+    client: object | None = None,
+) -> pl.DataFrame:
+    """拉取指数单周期 K 线 (不复权)。period 为 TickFlow 字面量 1m/5m/.../1d。
+
+    优先 start/end 窗口; 调用方在根数不足时再以 count 模式要最大条数。
+    """
+    kwargs: dict = {
+        "period": period,
+        "count": count,
+        "adjust": "none",
+        "as_dataframe": True,
+        "show_progress": False,
+    }
+    if start is not None:
+        kwargs["start_time"] = _datetime_to_ms(start)
+    if end is not None:
+        kwargs["end_time"] = _datetime_to_ms(end)
+    try:
+        tf = client or get_client()
+        raw = tf.klines.batch([symbol], **kwargs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("fetch_index_period(%s, %s) failed: %s", symbol, period, e)
+        return pl.DataFrame()
+
+    if isinstance(raw, dict):
+        sub = raw.get(symbol)
+        if sub is None or len(sub) == 0:
+            return pl.DataFrame()
+        if period == "1d":
+            return _normalize_daily(sub, default_symbol=symbol)
+        return _normalize_minute(sub, default_symbol=symbol)
+    if raw is None or len(raw) == 0:
+        return pl.DataFrame()
+    if period == "1d":
+        return _normalize_daily(raw, default_symbol=symbol)
+    return _normalize_minute(raw, default_symbol=symbol)
 
 
 def fetch_minute_single(

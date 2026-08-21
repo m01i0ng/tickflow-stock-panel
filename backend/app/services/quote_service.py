@@ -720,12 +720,16 @@ class QuoteService:
             self._flush_live_enriched(daily_df, quote_extra, asset_type="stock")
         if not etf_daily_df.is_empty() and self._repo:
             self._flush_live_enriched(etf_daily_df, etf_quote_extra, asset_type="etf")
-        # ---- 指数: 仅有指数监控规则时才写盘 (无规则零成本) ----
-        # mode=all (完整 CN_Index universe) → flush 覆盖; mode=core (部分标的) → merge 不截断分区
+        # ---- 指数: 内存始终叠当天 OHLC (缠论日线盘中刷新, 不写全市场 parquet)
+        # 有指数监控规则才落盘; mode=all → flush 覆盖, mode=core → merge 不截断分区
         engine = getattr(self._app_state, "monitor_engine", None) if self._app_state else None
-        if engine and engine.has_asset_rules("index") and self._repo:
-            index_daily_df = self._build_daily(index_records)
-            if not index_daily_df.is_empty():
+        index_daily_df = self._build_daily(index_records)
+        if not index_daily_df.is_empty() and self._repo:
+            try:
+                self._repo.overlay_live_enriched_memory("index", index_daily_df)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("指数日K内存覆盖失败: %s", e)
+            if engine and engine.has_asset_rules("index"):
                 use_flush = preferences.get_realtime_index_mode() == "all"
                 try:
                     if use_flush:

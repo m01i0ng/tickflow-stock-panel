@@ -81,6 +81,8 @@ export interface ChartMarker {
   date: string
   label?: string
   color?: string
+  /** 标记点 y 坐标(价格);缺省时 above=false 取 bar 低点, 否则取 bar 高点 */
+  price?: number
   above?: boolean
 }
 export interface ChartRange {
@@ -88,6 +90,28 @@ export interface ChartRange {
   end: string
   label?: string
   color?: string
+  /** 有界矩形 y 区间(缠论中枢 zg/zd); 都不传则全高度高亮 */
+  from?: number
+  to?: number
+}
+
+/** 缠论中枢(zg/zd 跨度渲染为区间内的水平线段) */
+export interface ZsBand {
+  sdt: string
+  edt: string
+  zg: number
+  zd: number
+}
+
+/** 缠论笔连线: 与 rows 日期对齐的折线段(sp -> ep 线性插值, 段间断开)。 */
+export interface ChanBiLine {
+  sdt: string
+  edt: string
+  sp: number
+  ep: number
+  dir: '向上' | '向下' | string
+  /** false = 未确认笔(虚线渲染) */
+  confirmed: boolean
 }
 
 interface Props {
@@ -103,6 +127,14 @@ interface Props {
   markers?: ChartMarker[]
   /** 预留:事件区间高亮 */
   ranges?: ChartRange[]
+  /** 缠论笔连线(按级别选中后传入; 实线=已确认, 虚线=未确认) */
+  biLines?: ChanBiLine[]
+  /** 缠论中枢(区间 zg/zd 跨度线) */
+  zsBands?: ZsBand[]
+  /** true: x 轴/叠加用 rows.date 原文 (缠论分钟级含时钟); false: 日K 仍按 YYYY-MM-DD */
+  useRawAxisKeys?: boolean
+  /** 默认可见 K 线根数; 不传则日K 约 120 根 (近 6 个月)。分钟级传入全量以按 TickFlow 上限展示。 */
+  defaultVisibleBars?: number
   /** 预留:点击某根 K 线 */
   onDateClick?: (date: string) => void
   height?: number
@@ -119,6 +151,10 @@ export function AnalysisKChart({
   defaultLevelTypes = ['sr', 'pivot', 'keltner_s'],
   markers,
   ranges,
+  biLines,
+  zsBands,
+  useRawAxisKeys = false,
+  defaultVisibleBars,
   onDateClick,
   height = 460,
   className,
@@ -137,16 +173,21 @@ export function AnalysisKChart({
 
   // 数据预处理 + 带状曲线序列对齐(后端 series 的日期范围可能与 rows 不同,需映射)
   const { dates, candle, vols, dateIndex, zoomStart, alignedSeries } = useMemo(() => {
-    const dates = rows.map(r => (typeof r.date === 'string' ? r.date.slice(0, 10) : String(r.date)))
+    const dates = rows.map(r => {
+      const s = typeof r.date === 'string' ? r.date : String(r.date)
+      return useRawAxisKeys ? s : s.slice(0, 10)
+    })
     const candle = rows.map(r => [r.open, r.close, r.low, r.high])
     const vols = rows.map(r => ({
       value: r.volume ?? 0,
       itemStyle: { color: r.close >= r.open ? THEME.volUp : THEME.volDown },
     }))
     const dateIndex = new Map(dates.map((d, i) => [d, i]))
-    // 默认显示最近 6 个月 ≈ 120 个交易日;数据不足则全部显示
-    const showBars = 120
-    const zoomStart = dates.length > showBars ? Math.round((1 - showBars / dates.length) * 100) : 0
+    // 日K 默认最近 6 个月 ≈ 120 根; 缠论分钟级传入全量 (TickFlow 上限)。
+    const showBars = defaultVisibleBars ?? 120
+    const zoomStart = dates.length > showBars && showBars > 0
+      ? Math.round((1 - showBars / dates.length) * 100)
+      : 0
 
     // 把后端 series(按 seriesDates 对齐)映射到前端 rows 的 dates 顺序
     const alignedSeries: Record<string, (number | null)[]> = {}
@@ -185,7 +226,7 @@ export function AnalysisKChart({
     }
 
     return { dates, candle, vols, dateIndex, zoomStart, alignedSeries }
-  }, [rows, series, seriesDates])
+  }, [rows, series, seriesDates, useRawAxisKeys, defaultVisibleBars])
 
   // 构建 option
   const buildOption = (): EChartsOption => {
@@ -203,24 +244,43 @@ export function AnalysisKChart({
     const volTop = PAD_TOP + mainH + GAP_MAIN_VOL
     const sliderBottom = PAD_BOTTOM
 
-    // 预留:markPoint(新闻标记)
+    // 预留:markPoint(新闻/缠论分型标记)。coord y: price 优先, above=false 取 bar 低点, 否则 bar 高点。
     const markPointData: any[] = (markers ?? [])
       .filter(m => dateIndex.has(m.date))
-      .map(m => ({
-        coord: [m.date, rows[dateIndex.get(m.date)!].high],
-        symbol: 'pin', symbolSize: 32,
-        itemStyle: { color: m.color ?? '#EAB308' },
-        label: { show: !!m.label, formatter: m.label ?? '', fontSize: 9, color: '#fff' },
-      }))
+      .map(m => {
+        const idx = dateIndex.get(m.date)!
+        const y = m.price ?? (m.above === false ? rows[idx].low : rows[idx].high)
+        return {
+          coord: [m.date, y],
+          symbol: 'pin', symbolSize: 26,
+          itemStyle: { color: m.color ?? '#EAB308' },
+          label: { show: !!m.label, formatter: m.label ?? '', fontSize: 9, color: '#fff' },
+        }
+      })
 
-    // 预留:markArea(事件区间)
+    // 预留:markArea(事件区间/缠论中枢矩形)。from/to 齐备时画出有界矩形(yAxis), 否则全高度高亮。
+    // 起止日做窗口钳制: 起点早于可见窗口时贴到窗口首日, 终点不在窗口则整段跳过。
     const markAreaData: any[] = (ranges ?? [])
-      .filter(r => dateIndex.has(r.start) && dateIndex.has(r.end))
-      .map(r => [{
-        xAxis: r.start, name: r.label ?? '',
-        itemStyle: { color: r.color ?? 'rgba(234,179,8,0.08)' },
-        label: r.label ? { show: true, position: 'insideTop', distance: 6, color: '#EAB308', fontSize: 10 } : undefined,
-      }, { xAxis: r.end }])
+      .filter(r => dateIndex.has(r.end))
+      .map(r => {
+        const bounded = r.from != null && r.to != null
+        const startX = dateIndex.has(r.start) ? r.start : dates[0]
+        const first = {
+          xAxis: startX,
+          ...(bounded ? { yAxis: r.from } : {}),
+          name: r.label ?? '',
+          itemStyle: {
+            color: r.color ?? 'rgba(139,92,246,0.12)',
+            borderColor: 'rgba(139,92,246,0.45)',
+            borderWidth: 1,
+          },
+          label: r.label ? {
+            show: true, position: 'insideTop', distance: 6, color: '#A78BFA', fontSize: 10,
+          } : undefined,
+        }
+        const last = { xAxis: r.end, ...(bounded ? { yAxis: r.to } : {}) }
+        return [first, last]
+      })
 
     const series: any[] = [
       {
@@ -309,6 +369,72 @@ export function AnalysisKChart({
       })
     }
 
+    // 缠论笔连线 —— 分型端点间的直线段 (sp -> ep 按日期等分插值, 段间断开)。
+    // 升级要点: 笔贴着价格路径走, 必须画在蜡烛(z=2)之上, 否则被实体完全遮挡;
+    // 颜色按方向拆分到 4 个系列(上/下 × 确认/未确认), 系列级 lineStyle 染色最可靠。
+    if (biLines && biLines.length > 0) {
+      const Z_BI = 3
+      const buildSeg = (wantDir: string, confirmed: boolean): (number | null)[] => {
+        const data: (number | null)[] = dates.map(() => null)
+        for (const bi of biLines) {
+          if (bi.dir !== wantDir || !!bi.confirmed !== confirmed) continue
+          let si = dateIndex.get(useRawAxisKeys ? bi.sdt : bi.sdt.slice(0, 10))
+          const ei = dateIndex.get(useRawAxisKeys ? bi.edt : bi.edt.slice(0, 10))
+          if (ei == null) continue
+          if (si == null) si = 0 // 笔起点早于窗口: 贴到窗口首日(只影响末端展示, 结构本身来自后端)
+          if (si >= ei) continue
+          const n = ei - si
+          for (let i = si; i <= ei; i++) {
+            data[i] = Number((bi.sp + ((bi.ep - bi.sp) * (i - si)) / n).toFixed(3))
+          }
+        }
+        return data
+      }
+      const pushBi = (data: (number | null)[], color: string, dashed: boolean, name: string) => {
+        if (!data.some(v => v != null)) return
+        series.push({
+          name, type: 'line', data, animation: false, symbol: 'none', silent: true, z: Z_BI,
+          lineStyle: { width: dashed ? 1.4 : 1.8, color, type: dashed ? 'dashed' : 'solid', opacity: 0.95 },
+        })
+      }
+      pushBi(buildSeg('向上', true), THEME.bull, false, '向上笔')
+      pushBi(buildSeg('向下', true), THEME.bear, false, '向下笔')
+      pushBi(buildSeg('向上', false), THEME.bull, true, '向上笔(未确认)')
+      pushBi(buildSeg('向下', false), THEME.bear, true, '向下笔(未确认)')
+    }
+
+    // 缠论中枢 —— zg/zd 在 [sdt, edt] 区间内的跨度线(与价位线同族渲染, 但置于蜡烛之上)。
+    // 早期用全高度 markArea 高亮: 10% 透明wash在整根价格轴上近似不可见, 这里改为明确线段。
+    if (zsBands && zsBands.length > 0) {
+      const Z_ZS = 2.5
+      for (const band of zsBands.slice(-6)) {
+        const spanData = (value: number): (number | null)[] => {
+          const data: (number | null)[] = dates.map(() => null)
+          let si = dateIndex.get(useRawAxisKeys ? band.sdt : band.sdt.slice(0, 10))
+          const ei = dateIndex.get(useRawAxisKeys ? band.edt : band.edt.slice(0, 10))
+          if (ei == null) return data
+          if (si == null) si = 0
+          if (si >= ei) return data
+          for (let i = si; i <= ei; i++) data[i] = value
+          return data
+        }
+        for (const [value, dashed, name] of [[band.zg, false, '中枢上沿'], [band.zd, true, '中枢下沿']] as const) {
+          const data = spanData(value)
+          if (!data.some(v => v != null)) continue
+          series.push({
+            name, type: 'line', data, animation: false, symbol: 'none', silent: true, z: Z_ZS,
+            lineStyle: { width: 1.1, color: '#8B5CF6', type: dashed ? 'dashed' : 'solid', opacity: 0.9 },
+            endLabel: {
+              show: true,
+              formatter: () => (dashed ? 'ZD ' : 'ZG ') + Number(value).toFixed(2),
+              color: '#A78BFA', fontSize: 9, fontFamily: 'JetBrains Mono, monospace',
+              backgroundColor: CT().infoBarBg, padding: [2, 5], borderRadius: 2, distance: 6,
+            },
+          })
+        }
+      }
+    }
+
     // 填充 seriesIndex → levelKey 映射(K/成交量索引 0/1 不参与联动)
     const keyMap = new Map<number, string>()
     // series[0]=K线, series[1]=成交量, 之后是按 priceLines + CURVE_DEFS 顺序 push 的
@@ -391,7 +517,7 @@ export function AnalysisKChart({
     }
     chartInstRef.current.setOption(buildOption(), true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, levels, series, seriesDates, activeTypes, pivotRank, markers, ranges, height, theme, hoveredKey])
+  }, [rows, levels, series, seriesDates, activeTypes, pivotRank, markers, ranges, biLines, zsBands, useRawAxisKeys, height, theme, hoveredKey])
 
   // resize
   useEffect(() => {

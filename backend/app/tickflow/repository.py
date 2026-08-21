@@ -36,6 +36,39 @@ def enriched_dirname(asset_type: str) -> str:
     return "kline_etf_enriched" if asset_type == "etf" else "kline_daily_enriched"
 
 
+_LIVE_OHLC_COLS = ("open", "high", "low", "close", "volume", "amount", "quote_ts")
+
+
+def _patch_ohlc_columns(base: pl.DataFrame, live: pl.DataFrame) -> pl.DataFrame:
+    """把 live 的 OHLC 写进 base 同行, 不丢 base 的额外列。"""
+    if live.is_empty() or "symbol" not in live.columns or "date" not in live.columns:
+        return base
+    ohlc = [c for c in _LIVE_OHLC_COLS if c in live.columns]
+    live_slim = live.select(["symbol", "date", *ohlc])
+    if base.is_empty():
+        return live_slim
+    joined = base.join(live_slim, on=["symbol", "date"], how="left", suffix="_live")
+    updates: list[pl.Expr] = []
+    drop: list[str] = []
+    for c in ohlc:
+        live_c = f"{c}_live"
+        if live_c not in joined.columns:
+            continue
+        if c in joined.columns:
+            updates.append(pl.coalesce(pl.col(live_c), pl.col(c)).alias(c))
+        else:
+            updates.append(pl.col(live_c).alias(c))
+        drop.append(live_c)
+    if updates:
+        joined = joined.with_columns(updates)
+    if drop:
+        joined = joined.drop(drop)
+    extra = live_slim.join(base.select(["symbol", "date"]), on=["symbol", "date"], how="anti")
+    if extra.is_empty():
+        return joined
+    return pl.concat([joined, extra], how="diagonal_relaxed")
+
+
 def _last_available_rows(df: pl.DataFrame, cutoff: date) -> pl.DataFrame:
     """从已按 symbol/date 排序的数据中取每只标的最后一条有效状态。"""
     if df.is_empty():
@@ -76,6 +109,7 @@ class DataStore:
             "kline_etf_enriched",
             "kline_etf_minute",
             "kline_minute",
+            "kline_index_minute",
             "adj_factor",
             "adj_factor_etf",
             "financials",
@@ -328,6 +362,8 @@ class KlineRepository:
         self._etf_symbol_set_cache: set[str] | None = None
         self._index_enriched_cache: pl.DataFrame | None = None
         self._index_enriched_cache_date: date | None = None
+        # 盘中报价 OHLC (不写 parquet、不替代 enriched 宽表)
+        self._live_ohlc_overlay: dict[str, tuple[date | None, pl.DataFrame]] = {}
 
         # ---- enriched 后台预热 ----
         # 启动时 compute_indicators (107万行, 低配机 50s+) 移出 lifespan 关键路径,
@@ -347,6 +383,7 @@ class KlineRepository:
         self._etf_enriched_glob = str(store.data_dir / "kline_etf_enriched" / "**" / "*.parquet")
         self._minute_glob = str(store.data_dir / "kline_minute" / "**" / "*.parquet")
         self._etf_minute_glob = str(store.data_dir / "kline_etf_minute" / "**" / "*.parquet")
+        self._index_minute_glob = str(store.data_dir / "kline_index_minute" / "**" / "*.parquet")
         self._inst_glob = str(store.data_dir / "instruments" / "**" / "*.parquet")
         self._index_inst_glob = str(store.data_dir / "instruments_index" / "**" / "*.parquet")
         self._etf_inst_glob = str(store.data_dir / "instruments_etf" / "**" / "*.parquet")
@@ -398,6 +435,7 @@ class KlineRepository:
         # 指数 enriched 同样只失效不重建 (懒加载)
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
+        self._live_ohlc_overlay = {}
 
         if background:
             logger.info("cache refresh: enriched 推后台线程预热")
@@ -490,6 +528,7 @@ class KlineRepository:
         self._etf_symbol_set_cache = None
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
+        self._live_ohlc_overlay = {}
 
     def _refresh_enriched(self) -> None:
         """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。
@@ -1387,6 +1426,34 @@ class KlineRepository:
         # 回退 scan_parquet
         return self._scan_daily_batch(symbols, start, end, columns)
 
+    def _overlay_asset_latest(
+        self,
+        df: pl.DataFrame,
+        asset_type: str,
+        symbol: str,
+        start: date,
+        end: date,
+        columns: list[str] | None,  # noqa: ARG002 — 与 get_daily 调用约定对齐, overlay 不裁历史列
+    ) -> pl.DataFrame:
+        """用内存 live OHLC 覆盖最新交易日, 历史行保留已计算的额外列。"""
+        overlay_date, overlay_df = self._live_ohlc_overlay.get(asset_type, (None, pl.DataFrame()))
+        if overlay_df is None or overlay_df.is_empty() or overlay_date is None:
+            overlay_df, overlay_date = self.get_enriched_latest_asset(asset_type, refresh=False)
+        if overlay_df is None or overlay_df.is_empty() or overlay_date is None:
+            return df
+        if not (start <= overlay_date <= end):
+            return df
+        part = overlay_df.filter(pl.col("symbol") == symbol) if "symbol" in overlay_df.columns else overlay_df
+        if part.is_empty():
+            return df
+        if df.is_empty():
+            return part
+        hist = df.filter(pl.col("date") != overlay_date)
+        out = pl.concat([hist, part], how="diagonal_relaxed")
+        if "date" in out.columns:
+            out = out.sort("date")
+        return out
+
     def get_index_daily(
         self,
         symbol: str,
@@ -1403,13 +1470,14 @@ class KlineRepository:
         if columns:
             df = self._scan_index_daily_symbol(symbol, start, end, columns)
             if not df.is_empty() and all(c in df.columns for c in columns):
-                return df
+                return self._overlay_asset_latest(df, "index", symbol, start, end, columns)
 
         warmup_start = start - timedelta(days=150)
         df = self._scan_index_daily_symbol(symbol, warmup_start, end, None)
         if not df.is_empty():
             df = self._compute_index_enriched_range(df)
             df = df.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        df = self._overlay_asset_latest(df, "index", symbol, start, end, columns)
         if columns and not df.is_empty():
             existing = [c for c in columns if c in df.columns]
             df = df.select(existing)
@@ -1462,8 +1530,12 @@ class KlineRepository:
         return pl.DataFrame()
 
     def _minute_glob_for(self, asset_type: str) -> str:
-        """按资产类型选择分钟K parquet glob。ETF 分钟数据独立存储于 kline_etf_minute。"""
-        return self._etf_minute_glob if asset_type == "etf" else self._minute_glob
+        """按资产类型选择分钟K parquet glob。ETF/指数分钟独立存储, 不进股票池。"""
+        if asset_type == "etf":
+            return self._etf_minute_glob
+        if asset_type == "index":
+            return self._index_minute_glob
+        return self._minute_glob
 
     def get_minute(
         self,
@@ -1535,6 +1607,24 @@ class KlineRepository:
             logger.warning("分钟K范围查询失败: %s", e)
             return pl.DataFrame()
 
+    def get_adj_factors(self, asset_type: str = "stock", symbols: list[str] | None = None) -> pl.DataFrame:
+        """读取已落盘的前复权因子 (symbol/trade_date/ex_factor)。指数无复权。"""
+        if asset_type == "index":
+            return pl.DataFrame()
+        table = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+        glob = str(self.store.data_dir / table / "**" / "*.parquet")
+        try:
+            lf = pl.scan_parquet(glob)
+            names = set(lf.collect_schema().names())
+            if "symbol" not in names:
+                return pl.DataFrame()
+            if symbols:
+                lf = lf.filter(pl.col("symbol").is_in(symbols))
+            return lf.collect()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("adj_factor 读取跳过 (%s): %s", asset_type, e)
+            return pl.DataFrame()
+
     def get_minute_by_dates(
         self,
         symbols: list[str],
@@ -1553,7 +1643,12 @@ class KlineRepository:
         """
         if not symbols or not dates:
             return pl.DataFrame()
-        base = self._etf_minute_glob.rsplit("/", 2)[0] if asset_type == "etf" else self._minute_glob.rsplit("/", 2)[0]
+        if asset_type == "etf":
+            base = self._etf_minute_glob.rsplit("/", 2)[0]
+        elif asset_type == "index":
+            base = self._index_minute_glob.rsplit("/", 2)[0]
+        else:
+            base = self._minute_glob.rsplit("/", 2)[0]
         # 收集存在的分区文件路径, 避免对不存在的文件 scan 报错
         parts: list[str] = []
         for d in dates:
@@ -2010,6 +2105,7 @@ class KlineRepository:
             "kline_etf_enriched": f"{d}/kline_etf_enriched/**/*.parquet",
             "kline_etf_minute": f"{d}/kline_etf_minute/**/*.parquet",
             "kline_minute": f"{d}/kline_minute/**/*.parquet",
+            "kline_index_minute": f"{d}/kline_index_minute/**/*.parquet",
             "adj_factor": f"{d}/adj_factor/**/*.parquet",
             "adj_factor_etf": f"{d}/adj_factor_etf/**/*.parquet",
             "instruments": f"{d}/instruments/**/*.parquet",
@@ -2156,6 +2252,31 @@ class KlineRepository:
             self._atomic_write_parquet(df_storage.sort(["symbol"]), out)
         if asset_type in {"stock", "etf"}:
             self._bump_matrix_data_generation(asset_type)
+
+    def overlay_live_enriched_memory(self, asset_type: str, df: pl.DataFrame) -> None:
+        """盘中 OHLC 叠到内存: 不写 parquet, 不把 enriched 宽表替换成窄 OHLC。
+
+        指数报价刷新用: Chan / get_index_daily 能看到最新收盘, 监控缓存仍保留 ma/macd。
+        """
+        if df.is_empty() or "date" not in df.columns or asset_type not in {"stock", "etf", "index"}:
+            return
+        dt = df["date"][0]
+        self._live_ohlc_overlay[asset_type] = (dt, df)
+        if asset_type == "stock":
+            existing, existing_date = self._enriched_cache, self._enriched_cache_date
+        elif asset_type == "etf":
+            existing, existing_date = self._etf_enriched_cache, self._etf_enriched_cache_date
+        else:
+            existing, existing_date = self._index_enriched_cache, self._index_enriched_cache_date
+        if existing is None or existing.is_empty() or existing_date != dt:
+            return
+        patched = _patch_ohlc_columns(existing, df).sort(["symbol"])
+        if asset_type == "stock":
+            self._enriched_cache = patched
+        elif asset_type == "etf":
+            self._etf_enriched_cache = patched
+        else:
+            self._index_enriched_cache = patched
 
     def flush_live_daily(self, df: pl.DataFrame) -> None:
         """覆写当天 kline_daily 分区 (实时行情落盘, 非merge)。"""

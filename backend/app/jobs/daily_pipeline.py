@@ -592,6 +592,7 @@ def _refresh_single_view(repo: KlineRepository, name: str) -> None:
         "kline_etf_enriched": f"{d}/kline_etf_enriched/**/*.parquet",
         "kline_etf_minute": f"{d}/kline_etf_minute/**/*.parquet",
         "kline_minute": f"{d}/kline_minute/**/*.parquet",
+        "kline_index_minute": f"{d}/kline_index_minute/**/*.parquet",
         "adj_factor": f"{d}/adj_factor/**/*.parquet",
         "adj_factor_etf": f"{d}/adj_factor_etf/**/*.parquet",
         "instruments": f"{d}/instruments/**/*.parquet",

@@ -65,6 +65,8 @@ export const QK = {
                            ['index-daily', symbol, start, end] as const,
   indexMinute:          (symbol: string, date: string) =>
                            ['index-minute', symbol, date] as const,
+  chanAnalysis:         (symbol: string, freqs: string, days?: number, start?: string, end?: string) =>
+                           ['chan-analysis', symbol, freqs, days ?? 10000, start ?? '', end ?? ''] as const,
 
   // Schema
   extDataSchemaAll:     ['ext-data-schema-all'] as const,

@@ -347,3 +347,54 @@ def sync_and_persist_etf_daily(
         gc.collect()
     repo.refresh_index_views()
     return total_rows
+
+
+def sync_and_persist_index_minute(
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    symbols: list[str],
+    days: int = 60,
+    on_chunk_done: Callable[[int, int, str], None] | None = None,
+) -> int:
+    """同步指数分钟K到独立 kline_index_minute parquet。返回写入行数。
+
+    与个股分钟K保持同一资产隔离: 指数明细走独立目录, 不进股票 kline_minute
+    (CONTRIBUTING §3.3 资产分路由)。上游 sync_minute_batch 按 10000 根/请求分段
+    (≈41 交易日) 并复用统一限频节奏; 落盘走流式回调 (每段一次), 复用
+    kline_sync 的原子分区合并写 (symbol, datetime 去重), 重复同步幂等。
+
+    范围: 每次从 [now-days, now] 增量同步 — 重叠区间由去重吸收, 不增请求数。
+    """
+    if not symbols or not capset.has(Cap.KLINE_MINUTE_BATCH):
+        return 0
+
+    now = datetime.now()
+    start_time = now - timedelta(days=days)
+    limit = resolve_limit(
+        capset,
+        Cap.KLINE_MINUTE_BATCH,
+        default_batch=50,
+        default_rpm=30,
+        default_rpm_when_unset=False,
+    )
+    minute_dir = repo.store.data_dir / "kline_index_minute"
+    written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
+
+    def _persist(seg_df: pl.DataFrame) -> None:
+        written_box[0] += kline_sync.write_minute_partition(seg_df, minute_dir)
+
+    kline_sync.sync_minute_batch(
+        symbols,
+        start_time=start_time,
+        end_time=now,
+        batch_size=limit.batch,
+        rpm=limit.rpm,
+        on_chunk_done=on_chunk_done,
+        segment_trading_days=preferences.get_minute_sync_segment_days(),
+        on_segment=_persist,
+        asset_type="index",
+    )
+
+    if written_box[0]:
+        logger.info("index minute synced: %d rows (%d symbols)", written_box[0], len(symbols))
+    return written_box[0]

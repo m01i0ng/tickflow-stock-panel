@@ -189,6 +189,73 @@ export interface AiStockReport {
   created_at: string
 }
 
+// ===== 缠论分析 (czsc) =====
+export interface ChanBar {
+  dt: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+}
+
+export interface ChanFx {
+  dt: string
+  price: number
+  mark: string
+  confirmed: boolean
+}
+
+export interface ChanBi {
+  sdt: string
+  edt: string
+  dir: string
+  sp: number
+  ep: number
+  confirmed: boolean
+}
+
+export interface ChanZs {
+  sdt: string
+  edt: string
+  zg: number
+  zd: number
+  gg: number
+  dd: number
+  dir: string
+}
+
+export interface ChanLevel {
+  freq: string
+  bars: ChanBar[]
+  fx: ChanFx[]
+  bi: ChanBi[]
+  zs: ChanZs[]
+  summary: string
+  signals?: Record<string, string>
+}
+
+export interface ChanAnalysis {
+  available: boolean
+  reason?: string
+  symbol: string
+  asset_type?: string
+  levels: ChanLevel[]
+  warnings: string[]
+}
+
+export interface ChanStatus {
+  installed: boolean
+  engine: string
+  supported_freqs: string[]
+  minute_support: { stock: boolean; etf: boolean; index: boolean }
+  default_days: number
+  minute_count_max?: number
+  bar_count_max?: number
+  tickflow_freqs?: string[]
+  synth_from?: Record<string, string>
+}
+
 // ===== Kline =====
 export interface MinuteKlineRow {
   datetime: string
@@ -1464,6 +1531,12 @@ export const api = {
     }>(
       `/api/index/minute?symbol=${encodeURIComponent(symbol)}${date ? `&date=${date}` : ''}`,
     ),
+
+  indexMinuteSync: (symbol: string, days = 60) =>
+    request<{ status: string; symbol: string; rows_written: number }>(
+      `/api/index/sync_minute?symbol=${encodeURIComponent(symbol)}&days=${days}`,
+      { method: 'POST' },
+    ),
   syncIndexInstruments: () =>
     request<{ status: string; count: number }>('/api/index/sync_instruments', { method: 'POST' }),
   syncIndexDaily: (days = 365) =>
@@ -1981,6 +2054,32 @@ export const api = {
 
   stockAnalysisReportDelete: (reportId: string) =>
     request<{ ok: boolean }>(`/api/stock-analysis/reports/${encodeURIComponent(reportId)}`, { method: 'DELETE' }),
+
+  // ===== 缠论分析 (czsc) =====
+  chanStatus: () =>
+    request<ChanStatus>('/api/chan/status'),
+
+  chanAnalysis: (symbol: string, days = 10000, freqs = '日线', start?: string, end?: string) => {
+    const q = new URLSearchParams({
+      symbol,
+      days: String(days),
+      freqs,
+    })
+    if (start) q.set('start', start)
+    if (end) q.set('end', end)
+    return request<ChanAnalysis>(`/api/chan/analysis?${q.toString()}`)
+  },
+
+  chanSyncMinute: (symbol: string) =>
+    request<{
+      status: string
+      symbol: string
+      asset_type?: string
+      rows_written: number
+      skipped?: boolean
+      count_max?: number
+      reason?: string
+    }>(`/api/chan/sync_minute?symbol=${encodeURIComponent(symbol)}`, { method: 'POST' }),
 
   /**
    * AI 个股四维分析 — 流式调用(NDJSON,与财务分析同协议)。
