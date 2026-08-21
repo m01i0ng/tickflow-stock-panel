@@ -144,7 +144,9 @@ RUN codex --version
 # 非 root 运行 (UID 1000 与常见主机首个用户一致)。
 # 注意: Linux 主机上 ./data 挂载卷的属主必须是 1000 (见 docs/deployment.md 迁移说明);
 # macOS (osxfs) 不校验属主, 无影响。
-RUN useradd --create-home --uid 1000 --gid 1000 tickflow \
+# Debian useradd 不会为显式 --gid 自动建组, 需先 groupadd (详见 CI 实构建验证)。
+RUN groupadd --gid 1000 tickflow \
+    && useradd --create-home --uid 1000 --gid 1000 tickflow \
     && chown -R tickflow:tickflow /app
 USER tickflow
 
