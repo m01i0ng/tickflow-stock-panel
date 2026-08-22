@@ -40,6 +40,13 @@ FACTOR_COLUMNS: list[dict] = [
 
 FACTOR_WARMUP_DAYS = 120
 
+# 批量评估单次最多因子数 (防止宽表/计算时间失控)
+FACTOR_BATCH_MAX = 60
+
+
+class FactorCancelled(Exception):
+    """任务被用户取消 (job.cancel_event 置位), 与计算错误区分。"""
+
 
 @dataclass
 class FactorConfig:
@@ -93,9 +100,27 @@ class FactorBacktestService:
     def __init__(self, engine: BacktestEngine) -> None:
         self.engine = engine
 
-    def run(self, config: FactorConfig) -> FactorResult:
+    def run(
+        self,
+        config: FactorConfig,
+        progress_cb=None,
+        cancel_event=None,
+    ) -> FactorResult:
+        """单因子回测。
+
+        progress_cb(event): 可选进度回调, event = {"pct", "stage", "message"}。
+        cancel_event(threading.Event): 置位后在阶段边界抛出 FactorCancelled。
+        """
         t0 = time.perf_counter()
         run_id = uuid.uuid4().hex[:10]
+
+        def _emit(pct: int, stage: str, message: str) -> None:
+            if progress_cb is not None:
+                progress_cb({"pct": pct, "stage": stage, "message": message})
+
+        def _check() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise FactorCancelled()
 
         def _err(msg: str) -> FactorResult:
             return FactorResult(
@@ -113,6 +138,8 @@ class FactorBacktestService:
         if config.factor_name not in {"turnover_rate"}:
             load_start = config.start - timedelta(days=FACTOR_WARMUP_DAYS)
 
+        _emit(2, "pending", "任务排队")
+        _check()
         panel = self.engine.load_panel(
             config.symbols,
             load_start,
@@ -126,6 +153,8 @@ class FactorBacktestService:
         factor_col = config.factor_name
         if factor_col not in panel.columns:
             panel = self._compute_missing_factor(panel, factor_col)
+        _check()
+        _emit(30, "factor", f"因子值就绪: {factor_col}")
         if factor_col not in panel.columns:
             return _err(f"因子列 '{factor_col}' 不存在于 enriched 数据中, 且无法从基础行情计算")
         if "close" not in panel.columns:
@@ -149,6 +178,7 @@ class FactorBacktestService:
 
         # 计算下期收益
         # 根据调仓频率计算不同周期的 forward return
+        _emit(42, "returns", "计算下期收益")
         if config.rebalance == "daily":
             panel = panel.with_columns(
                 (pl.col("close").shift(-1).over("symbol") / pl.col("close") - 1)
@@ -170,16 +200,24 @@ class FactorBacktestService:
         ic_std = float(np.std(ic_values)) if ic_values else None
         ir = (ic_mean / ic_std) if (ic_mean is not None and ic_std and ic_std > 1e-8) else None
         ic_win_rate = (sum(1 for v in ic_values if v > 0) / len(ic_values)) if ic_values else None
+        _check()
+        _emit(60, "ic", f"Rank IC 均值 {ic_mean:.4f}" if ic_mean is not None else "Rank IC 完成")
 
         # ── 2. 分层回测 ──
         panel = self._add_groups(panel, factor_col, config.n_groups)
+        if config.weight == "factor_weight":
+            panel = self._add_factor_weights(panel, factor_col)
         group_nav = self._calc_group_nav(panel, config)
+        _emit(78, "groups", "分层净值完成")
         group_stats = self._calc_group_stats(group_nav, config.start, config.end, config.rebalance)
 
         # ── 3. 多空组合 ──
         long_short_nav, long_short_stats = self._calc_long_short(group_nav, config)
+        _check()
+        _emit(95, "ls", "多空组合完成")
 
         elapsed = (time.perf_counter() - t0) * 1000
+        _emit(100, "done", "完成")
         return FactorResult(
             run_id=run_id,
             config=self._config_to_dict(config),
@@ -230,39 +268,45 @@ class FactorBacktestService:
             .sort("date")
         )
 
+    @staticmethod
+    def _rebalance_dates(all_dates: list, rebalance: str) -> list:
+        """调仓日 = 每个交易周期(ISO 周 / 自然月)的首个交易日。
+
+        weekly 不能直接按 weekday==0(Monday) 判定: A 股节假日周(春节/国庆)
+        的第一个交易日往往是周二甚至周三, 按周一判定会整周跳过调仓。
+        这里按交易日所属的 ISO 周分组, 每组第一个交易日即调仓日;
+        monthly 按 (年, 月) 分组同理(与"每月首个交易日"一致)。
+        """
+        if rebalance == "weekly":
+
+            def _key(d):
+                return (d.isocalendar().year, d.isocalendar().week)
+        else:
+
+            def _key(d):
+                return (d.year, d.month)
+
+        result: list = []
+        seen: set = set()
+        for d in sorted(all_dates):
+            k = _key(d)
+            if k not in seen:
+                seen.add(k)
+                result.append(d)
+        return result
+
     # ── 调仓期收益 ──
 
     @staticmethod
     def _calc_period_return(panel: pl.DataFrame, rebalance: str) -> pl.DataFrame:
         """计算到下个调仓日的收益。
 
-        weekly: 下个周调仓日 close / 今日 close - 1
-        monthly: 下个月调仓日 close / 今日 close - 1
+        weekly: 下个 ISO 周首交易日 close / 今日 close - 1
+        monthly: 下个月首交易日 close / 今日 close - 1
         只在调仓日标记行有效，其他行为 null。
         """
-        import datetime as _dt
-
         all_dates = sorted(panel["date"].unique().to_list())
-
-        if rebalance == "weekly":
-            # 调仓日 = 每周一
-            rebalance_dates = set()
-            for d in all_dates:
-                if hasattr(d, "weekday"):
-                    wd = d.weekday()
-                else:
-                    wd = _dt.date.fromisoformat(str(d)).weekday()
-                if wd == 0:  # Monday
-                    rebalance_dates.add(d)
-        else:  # monthly
-            # 调仓日 = 每月首个交易日
-            seen_months: set[str] = set()
-            rebalance_dates = set()
-            for d in sorted(all_dates):
-                m = str(d)[:7]  # "YYYY-MM"
-                if m not in seen_months:
-                    seen_months.add(m)
-                    rebalance_dates.add(d)
+        rebalance_dates = FactorBacktestService._rebalance_dates(all_dates, rebalance)
 
         if not rebalance_dates:
             panel = panel.with_columns(pl.lit(None).cast(pl.Float64).alias("_next_return"))
@@ -360,25 +404,120 @@ class FactorBacktestService:
                 pass
         return 0
 
+    # ── 因子加权 ──
+
+    @staticmethod
+    def _add_factor_weights(panel: pl.DataFrame, factor_col: str) -> pl.DataFrame:
+        """组内按 |因子 − 组均值| 归一作为持仓权重 (绝对暴露度加权)。
+
+        暴露偏离组均值越大, 权重越高; 组内因子无差异(分母≈0)时回落等权。
+        只有调仓日行参与收益聚合, 权重仅在这些行上有意义。
+        """
+        d = pl.col(factor_col) - pl.col(factor_col).mean().over(["date", "_group"])
+        s = d.abs().sum().over(["date", "_group"])
+        n = pl.len().over(["date", "_group"])
+        w = (d.abs() / s).fill_nan(0.0)
+        return panel.with_columns(
+            pl.when(s > 1e-12).then(w).otherwise(1.0 / n).alias("_weight")
+        )
+
+    # ── 换手率与成本 ──
+
+    @staticmethod
+    def _calc_group_turnover(reb: pl.DataFrame) -> pl.DataFrame:
+        """计算每 (date, group) 的换手率。
+
+        换手率 = 1 - |A_t ∩ A_{t-1}| / |A_t|: 相对上一调仓日、同组持仓中被替换
+        的比例。组规模逐期近似不变, 换出与换入对称, 故一个周期产生一次买入成本
+        与一次卖出成本(首期除外)。首个调仓日没有旧持仓, turnover 缺省记 1.0
+        并置 _first=True, 只计建仓单边成本。
+        """
+        dates = sorted(reb["date"].unique().to_list())
+        prev_map = {dates[i + 1]: dates[i] for i in range(len(dates) - 1)}
+        dtype = reb.schema["date"]
+
+        prev_df = (
+            pl.DataFrame({"date": list(prev_map.keys()), "_prev_date": list(prev_map.values())})
+            .with_columns(pl.col("date").cast(dtype), pl.col("_prev_date").cast(dtype))
+        )
+        same_group_held = (
+            reb.join(prev_df, on="date", how="inner")
+            .join(
+                reb.select(
+                    pl.col("symbol"),
+                    pl.col("date").alias("_prev_date"),
+                    pl.col("_group").alias("_prev_group"),
+                ),
+                on=["symbol", "_prev_date"],
+                how="inner",
+            )
+            .filter(pl.col("_prev_group") == pl.col("_group"))
+        )
+        matched = (
+            same_group_held.group_by(["date", "_group"])
+            .len()
+            .rename({"len": "_stayed_count"})
+        )
+        total = reb.group_by(["date", "_group"]).len().rename({"len": "_total_count"})
+
+        first_date = dates[0]
+        return (
+            total.join(matched, on=["date", "_group"], how="left")
+            .with_columns(pl.col("_stayed_count").fill_null(0))
+            .with_columns(
+                (1.0 - pl.col("_stayed_count") / pl.col("_total_count")).alias("_turnover"),
+                (pl.col("date") == first_date).alias("_first"),
+            )
+            .select(["date", "_group", "_turnover", "_first"])
+        )
+
     # ── 分组净值 ──
 
     @staticmethod
     def _calc_group_nav(panel: pl.DataFrame, config: FactorConfig) -> list[dict]:
-        """计算分组净值曲线 — 只在调仓日更新净值。"""
-        # 只保留有下期收益的行 (= 调仓日)
-        group_ret = (
+        """计算分组净值曲线 — 只在调仓日更新净值。
+
+        毛收益: equal → 组内下期收益均值; factor_weight → 按 _weight 加权。
+        成本: 每个调仓周期扣除 换手率 × (fees_pct + slippage/10000) 的双边
+        成本(首期只计建仓单边)。净值由扣费后的净收益累乘得到。
+        """
+        reb = (
             panel.filter(pl.col("_next_return").is_not_null() & pl.col("_group").is_not_null())
-            .group_by(["date", "_group"])
-            .agg(pl.col("_next_return").mean().alias("group_return"))
+        )
+        if reb.is_empty():
+            return []
+
+        if config.weight == "factor_weight":
+            agg = reb.group_by(["date", "_group"]).agg(
+                (pl.col("_next_return") * pl.col("_weight")).sum().alias("group_return")
+            )
+        else:
+            agg = reb.group_by(["date", "_group"]).agg(
+                pl.col("_next_return").mean().alias("group_return")
+            )
+
+        turnover = FactorBacktestService._calc_group_turnover(reb)
+        agg = agg.join(turnover, on=["date", "_group"], how="left")
+        leg = config.fees_pct + config.slippage_bps / 10000.0
+        agg = agg.with_columns(
+            (
+                pl.col("group_return")
+                - leg
+                * pl.col("_turnover")
+                * (2.0 - pl.col("_first").cast(pl.Float64))
+            ).alias("group_return")
         )
 
         # pivot: date × group
-        pivot = group_ret.pivot(index="date", columns="_group", values="group_return").sort("date")
+        pivot = agg.pivot(index="date", on="_group", values="group_return").sort("date")
 
         if pivot.is_empty():
             return []
 
-        group_cols = sorted([c for c in pivot.columns if c != "date"], key=FactorBacktestService._group_sort_key)
+        group_cols = sorted(
+            [c for c in pivot.columns if c != "date"],
+            key=FactorBacktestService._group_sort_key,
+        )
 
         # 累乘净值曲线
         result: list[dict] = []
@@ -506,9 +645,28 @@ class FactorBacktestService:
             ls_nav.append({"date": row["date"], "value": round(ls_value, 4)})
 
         total_ret = ls_value - 1.0
+        values = [r["value"] for r in ls_nav]
+        years = max((config.end - config.start).days, 1) / 365.25
+        annual = (values[-1] ** (1 / years) - 1) if values and values[-1] > 0 else 0.0
+        ls_rets = [
+            values[i] / values[i - 1] - 1
+            for i in range(1, len(values))
+            if values[i - 1] > 0
+        ]
+        if ls_rets:
+            arr = np.array(ls_rets)
+            _ann = {"daily": 252, "weekly": 52, "monthly": 12}.get(config.rebalance, 252)
+            sharpe = float(np.mean(arr) / np.std(arr)) * np.sqrt(_ann) if np.std(arr) > 0 else 0.0
+            win_rate = float(np.mean(arr > 0))
+        else:
+            sharpe = 0.0
+            win_rate = 0.0
         ls_stats = {
             "total_return": round(total_ret, 4),
+            "annual_return": round(annual, 4),
             "max_drawdown": round(max_dd, 4),
+            "sharpe": round(sharpe, 2),
+            "win_rate": round(win_rate, 4),
             "top_group": top_col,
             "bottom_group": bottom_col,
         }
@@ -527,4 +685,211 @@ class FactorBacktestService:
             "weight": c.weight,
             "fees_pct": c.fees_pct,
             "slippage_bps": c.slippage_bps,
+            "asset_type": c.asset_type,
+        }
+
+    def run_batch(
+        self,
+        factors: list[str],
+        config: FactorConfig,
+        progress_cb=None,
+        cancel_event=None,
+    ) -> dict:
+        """多因子批量评估 — 共享面板与下期收益, 逐因子算 IC / 分层 / 多空。
+
+        与单因子复用同一套口径 (Rank IC、序号分桶、换手率成本、Q5-Q1 多空),
+        额外输出因子间「日 IC 序列」的相关矩阵。共用的面板与 forward return
+        保证各因子在同一股票池/日期网格上可比。
+
+        progress_cb / cancel_event 语义与 run() 一致。
+        返回 dict:
+          {run_id, config, factors:[{name, ic_mean, ic_std, ir, ic_win_rate,
+             ic_obs, ls_total_return, ls_annual_return, ls_sharpe, ls_win_rate}],
+           skipped:[...], ic_corr:{names, matrix}, n_symbols, n_dates,
+           elapsed_ms, error}
+        """
+        t0 = time.perf_counter()
+        run_id = uuid.uuid4().hex[:10]
+
+        def _emit(pct: int, stage: str, message: str) -> None:
+            if progress_cb is not None:
+                progress_cb({"pct": pct, "stage": stage, "message": message})
+
+        def _check() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise FactorCancelled()
+
+        def _err(msg: str) -> dict:
+            return {
+                "run_id": run_id,
+                "config": self._config_to_dict(config),
+                "factors": [],
+                "skipped": list(factors),
+                "ic_corr": {"names": [], "matrix": []},
+                "n_symbols": 0,
+                "n_dates": 0,
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "error": msg,
+            }
+
+        names = list(dict.fromkeys(factors))
+        if not names:
+            return _err("未指定因子")
+        truncated = False
+        if len(names) > FACTOR_BATCH_MAX:
+            names = names[:FACTOR_BATCH_MAX]
+            truncated = True
+
+        base_cols = ["symbol", "date", "open", "high", "low", "close",
+                     "volume", "turnover_rate"]
+        panel_columns = base_cols + [f for f in names if f not in base_cols]
+        load_start = config.start - timedelta(days=FACTOR_WARMUP_DAYS)
+
+        _emit(2, "pending", "任务排队")
+        _check()
+        panel = self.engine.load_panel(
+            config.symbols, load_start, config.end,
+            columns=panel_columns, asset_type=config.asset_type,
+        )
+        if panel.is_empty():
+            return _err("无数据，请检查日期范围或先运行盘后管道")
+
+        # 缺列因子一次性补算 (compute_indicators needed 支持批量)。
+        # 未知/不可计算的因子名会被流水线拒绝: try/except 兜底, 这类因子
+        # 保持缺失, 后续逐因子标记 skipped (不允许一个坏名字拖垮整批)。
+        missing = [f for f in names if f not in panel.columns]
+        if missing:
+            try:
+                from app.indicators.pipeline import compute_indicators
+
+                required = {"symbol", "date", "open", "high", "low", "close", "volume"}
+                if required.issubset(panel.columns):
+                    computed = compute_indicators(panel, needed=set(missing))
+                    new_cols = [c for c in computed.columns if c in missing]
+                    if new_cols:
+                        add = computed.select(
+                            ["symbol", "date"] + [c for c in new_cols if c not in ("symbol", "date")]
+                        )
+                        panel = panel.join(add, on=["symbol", "date"], how="left")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("factor batch: 批量补算失败 (未知因子将标记 skipped): %s", e)
+        _check()
+        _emit(30, "panel", f"面板就绪: {len(names)} 个因子")
+
+        panel = panel.filter(
+            (pl.col("date") >= config.start) & (pl.col("date") <= config.end)
+        ).filter(pl.col("close").is_not_null() & (pl.col("close") > 0))
+        if panel.is_empty():
+            return _err("过滤后无有效数据")
+
+        # 下期收益只取决于日期网格: 全因子共享, 计算一次
+        _emit(40, "returns", "计算下期收益")
+        if config.rebalance == "daily":
+            ret_df = panel.select(["symbol", "date", "close"]).with_columns(
+                (pl.col("close").shift(-1).over("symbol") / pl.col("close") - 1)
+                .alias("_next_return")
+            )
+        else:
+            ret_df = self._calc_period_return(
+                panel.select(["symbol", "date", "close"]), config.rebalance
+            ).select(["symbol", "date", "_next_return"])
+
+        n_symbols = panel["symbol"].n_unique()
+        n_dates = panel["date"].n_unique()
+
+        records: list[dict] = []
+        skipped: list[str] = []
+        ic_series_by: dict[str, dict] = {}
+        total = len(names)
+        for idx, name in enumerate(names):
+            _check()
+            if name not in panel.columns:
+                skipped.append(name)
+                continue
+            sub = panel.select(["symbol", "date", "close", name]).join(
+                ret_df, on=["symbol", "date"], how="left"
+            )
+            sub = sub.filter(
+                pl.col(name).is_not_null()
+                & pl.col("_next_return").is_not_null()
+                & pl.col("close").is_not_null()
+                & (pl.col("close") > 0)
+            )
+            if sub.is_empty():
+                skipped.append(name)
+                continue
+
+            ic_df = self._calc_ic(sub, name)
+            ic_rows = [
+                (str(row["date"]), float(row["ic"]))
+                for row in ic_df.iter_rows(named=True)
+                if row["ic"] is not None and not np.isnan(float(row["ic"]))
+            ]
+            ic_vals = [v for _, v in ic_rows]
+            ic_mean = float(np.mean(ic_vals)) if ic_vals else None
+            ic_std = float(np.std(ic_vals)) if ic_vals else None
+            ir = (ic_mean / ic_std) if (ic_mean is not None and ic_std and ic_std > 1e-8) else None
+            ic_win = (sum(1 for v in ic_vals if v > 0) / len(ic_vals)) if ic_vals else None
+            ic_series_by[name] = dict(ic_rows)
+
+            grouped = self._add_groups(sub, name, config.n_groups)
+            nav = self._calc_group_nav(grouped, config)
+            _, ls_stats = self._calc_long_short(nav, config)
+
+            records.append({
+                "name": name,
+                "ic_mean": round(ic_mean, 4) if ic_mean is not None else None,
+                "ic_std": round(ic_std, 4) if ic_std is not None else None,
+                "ir": round(ir, 4) if ir is not None else None,
+                "ic_win_rate": round(ic_win, 4) if ic_win is not None else None,
+                "ic_obs": len(ic_vals),
+                "ls_total_return": ls_stats.get("total_return"),
+                "ls_annual_return": ls_stats.get("annual_return"),
+                "ls_sharpe": ls_stats.get("sharpe"),
+                "ls_win_rate": ls_stats.get("win_rate"),
+            })
+            pct = 45 + int(idx / total * 45)
+            _emit(pct, "factor", f"完成 {name} ({idx + 1}/{total})")
+
+        corr_names: list[str] = []
+        corr_matrix: list[list] = []
+        with_values = [name for name in names if ic_series_by.get(name)]
+        if len(with_values) >= 2:
+            _emit(95, "corr", "计算 IC 相关矩阵")
+            # 对齐公共 IC 日期后两两 Pearson
+            common = None
+            for name in with_values:
+                ds = set(ic_series_by[name])
+                common = ds if common is None else common & ds
+            aligned = {
+                name: [ic_series_by[name][d] for d in sorted(common)]
+                for name in with_values
+                if all(d in ic_series_by[name] for d in common)
+            }
+            corr_names = list(aligned)
+            arrs = np.array([aligned[n] for n in corr_names], dtype=float)
+            cm = np.corrcoef(arrs)
+            if arrs.shape[1] >= 2 and not np.isnan(cm).all():
+                corr_matrix = [
+                    [round(float(v), 4) if not np.isnan(v) else None for v in row]
+                    for row in cm.tolist()
+                ]
+
+        skipped = list(dict.fromkeys(skipped))
+        message = f"完成 {len(records)}/{total} 个因子"
+        if truncated:
+            message += f", 已截断到 {FACTOR_BATCH_MAX} 个"
+        if skipped:
+            message += f", 跳过 {len(skipped)} 个"
+        _emit(100, "done", message)
+        return {
+            "run_id": run_id,
+            "config": self._config_to_dict(config),
+            "factors": records,
+            "skipped": skipped,
+            "ic_corr": {"names": corr_names, "matrix": corr_matrix},
+            "n_symbols": n_symbols,
+            "n_dates": n_dates,
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": None,
         }

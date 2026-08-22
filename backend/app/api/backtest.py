@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
+import time
 from dataclasses import asdict
 from datetime import date, timedelta
 from typing import Literal
@@ -180,6 +182,281 @@ def factor_run(req: FactorBacktestRequest, request: Request):
     return asdict(result)
 
 
+# ══════════════════════════════════════════════════════════════
+# 因子回测 SSE 流 — 复用 _BacktestJob 框架: 后台线程执行, 不阻塞请求线程;
+# 进度/结果经 SSE 推送, job_key 回吐给前端用于取消, 结果落盘供历史查询。
+# ══════════════════════════════════════════════════════════════
+
+def _factor_job_key(
+    kind: str,
+    factor_name: str,
+    factor_names: str,
+    symbols: str | None,
+    start: str | None,
+    end: str | None,
+    n_groups: int,
+    rebalance: str,
+    weight: str,
+    fees_pct: float,
+    slippage_bps: float,
+    asset_type: str,
+) -> str:
+    raw = (
+        f"factor|{kind}|{factor_name}|{factor_names}|{symbols}|{start}|{end}"
+        f"|{n_groups}|{rebalance}|{weight}|{fees_pct}|{slippage_bps}|{asset_type}"
+    )
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _factor_config(
+    request: Request,
+    *,
+    symbols: str | None,
+    start: str | None,
+    end: str | None,
+    n_groups: int,
+    rebalance: str,
+    weight: str,
+    fees_pct: float,
+    slippage_bps: float,
+    asset_type: str,
+):
+    """query string → FactorConfig (含服务端范围/标的守卫)。"""
+    from app.backtest.factor import FactorConfig
+
+    end_date = date.fromisoformat(end) if end else date.today()
+    start_date = date.fromisoformat(start) if start else end_date - timedelta(days=FACTOR_DEFAULT_DAYS)
+    _guard_server_backtest_range(start_date, end_date)
+
+    symbol_list = None
+    if symbols:
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        if len(symbol_list) > FACTOR_MAX_SYMBOLS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"指定标的最多支持 {FACTOR_MAX_SYMBOLS} 只，请缩小标的范围。",
+            )
+    return FactorConfig(
+        factor_name="",
+        symbols=symbol_list,
+        start=start_date,
+        end=end_date,
+        n_groups=int(n_groups),
+        rebalance=rebalance,  # type: ignore[arg-type]
+        weight=weight,  # type: ignore[arg-type]
+        fees_pct=float(fees_pct),
+        slippage_bps=float(slippage_bps),
+        asset_type=asset_type,
+    )
+
+
+async def _sse_job_stream(request: Request, job: "_BacktestJob"):
+    """通用 job 进度流: 首事件回吐 job_key, 支持断线重连回放 (带 idx 去重)。
+
+    每轮先回放积累的进度, 再判终态 —— 短任务瞬间完成时也不丢进度事件。
+    """
+    payload = json.dumps({"job_key": job.key}, ensure_ascii=False)
+    yield f"event: start\ndata: {payload}\n\n"
+    cursor = 0
+    tick = 0
+    while True:
+        # 1) 回放进度
+        prog = job.progress
+        while cursor < len(prog):
+            msg = dict(prog[cursor])
+            msg["idx"] = cursor
+            cursor += 1
+            yield f"event: progress\ndata: {json.dumps(msg, ensure_ascii=False, default=str)}\n\n"
+
+        # 2) 终态
+        if job.done:
+            if job.error:
+                message = "因子分析已取消" if job.error == "cancelled" else job.error
+                yield f"event: error\ndata: {json.dumps({'message': message}, ensure_ascii=False)}\n\n"
+            elif job.result is not None:
+                data = json.dumps(_json_safe(job.result), ensure_ascii=False, default=str)
+                yield f"event: done\ndata: {data}\n\n"
+            return
+
+        tick += 1
+        if tick % 4 == 0 and await request.is_disconnected():
+            break
+        await asyncio.sleep(0.1)
+
+
+def _spawn_factor_job(
+    request: Request,
+    job: "_BacktestJob",
+    kind: str,
+    run_fn,
+    action: str,
+) -> None:
+    """后台线程: 信号量限并发 → 执行 → 持久化 → _finish_job。"""
+    from app.backtest.factor import FactorCancelled
+    from app.backtest.factor_results import save_result
+
+    data_dir = request.app.state.repo.store.data_dir
+
+    def _run() -> None:
+        _backtest_semaphore.acquire()
+        try:
+            result = run_fn(
+                progress_cb=lambda e: job.progress.append(e),
+                cancel_event=job.cancel_event,
+            )
+            if kind == "batch":
+                if result.get("error"):
+                    _finish_job(job, error=result["error"])
+                    return
+                save_result(data_dir, result["run_id"], {"kind": "batch", "data": result})
+                _finish_job(job, result={"batch": result})
+            else:
+                if getattr(result, "error", None):
+                    # 业务级失败 (无数据/区间非法等) 走 error 事件, 不落盘
+                    _finish_job(job, error=result.error)
+                    return
+                save_result(data_dir, result.run_id, {"kind": "single", "data": asdict(result)})
+                _finish_job(job, result={"result": asdict(result)})
+        except FactorCancelled:
+            _finish_job(job, error="cancelled")
+        except Exception as e:  # noqa: BLE001
+            logger.exception("factor %s job failed", action)
+            _finish_job(job, error=str(e))
+        finally:
+            _backtest_semaphore.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@router.get("/factor/stream")
+async def factor_stream(
+    request: Request,
+    factor_name: str,
+    symbols: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    n_groups: int = 5,
+    rebalance: str = "monthly",
+    weight: str = "equal",
+    fees_pct: float = 0.0002,
+    slippage_bps: float = 5.0,
+    asset_type: str = "stock",
+):
+    """SSE 流式单因子回测 — 事件: start(job_key) / progress / done / error。"""
+    from app.backtest.factor import FactorBacktestService
+    from dataclasses import replace
+
+    cfg = _factor_config(
+        request,
+        symbols=symbols, start=start, end=end, n_groups=n_groups,
+        rebalance=rebalance, weight=weight, fees_pct=fees_pct,
+        slippage_bps=slippage_bps, asset_type=asset_type,
+    )
+    cfg = replace(cfg, factor_name=factor_name)
+    key = _factor_job_key(
+        "single", factor_name, "", symbols, start, end, n_groups,
+        rebalance, weight, fees_pct, slippage_bps, asset_type,
+    )
+    with _jobs_lock:
+        job = _running_jobs.get(key)
+        if job is None:
+            job = _BacktestJob(key)
+            _running_jobs[key] = job
+            engine = _get_engine(request)
+            svc = FactorBacktestService(engine)
+            _spawn_factor_job(request, job, "single", lambda **kw: svc.run(cfg, **kw), "single")
+
+    return StreamingResponse(
+        _sse_job_stream(request, job),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/factor/batch/stream")
+async def factor_batch_stream(
+    request: Request,
+    factor_names: str,
+    symbols: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    n_groups: int = 5,
+    rebalance: str = "monthly",
+    fees_pct: float = 0.0002,
+    slippage_bps: float = 5.0,
+    asset_type: str = "stock",
+):
+    """SSE 流式多因子批量评估 — 事件: start(job_key) / progress / done(batch) / error。"""
+    from app.backtest.factor import FactorBacktestService
+    from dataclasses import replace
+
+    names = [s.strip() for s in factor_names.split(",") if s.strip()]
+    if not names:
+        raise HTTPException(status_code=400, detail="factor_names 不能为空")
+
+    cfg = _factor_config(
+        request,
+        symbols=symbols, start=start, end=end, n_groups=n_groups,
+        rebalance=rebalance, weight="equal", fees_pct=fees_pct,
+        slippage_bps=slippage_bps, asset_type=asset_type,
+    )
+    cfg = replace(cfg, factor_name=names[0], weight="equal")
+    key = _factor_job_key(
+        "batch", names[0], ",".join(names), symbols, start, end, n_groups,
+        rebalance, "equal", fees_pct, slippage_bps, asset_type,
+    )
+    with _jobs_lock:
+        job = _running_jobs.get(key)
+        if job is None:
+            job = _BacktestJob(key)
+            _running_jobs[key] = job
+            engine = _get_engine(request)
+            svc = FactorBacktestService(engine)
+            _spawn_factor_job(
+                request, job, "batch",
+                lambda **kw: svc.run_batch(names, cfg, **kw),
+                "batch",
+            )
+
+    return StreamingResponse(
+        _sse_job_stream(request, job),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/factor/cancel")
+async def factor_cancel(request: Request):
+    """取消运行中的因子任务 (用 stream 首事件回吐的 job_key 查表)。"""
+    body = await request.json()
+    key = body.get("job_key", "")
+    with _jobs_lock:
+        job = _running_jobs.get(key)
+    if job and not job.done:
+        job.cancel_event.set()
+        return {"ok": True}
+    return {"ok": False, "message": "任务不存在或已完成"}
+
+
+@router.get("/factor/history")
+def factor_history(request: Request, limit: int = 20):
+    """最近 N 次因子结果摘要 (新到旧), 供回测页历史面板。"""
+    from app.backtest.factor_results import list_results
+
+    return {"items": list_results(request.app.state.repo.store.data_dir, min(max(limit, 1), 100))}
+
+
+@router.get("/factor/history/{run_id}")
+def factor_history_item(run_id: str, request: Request):
+    """加载一次完整结果 (含净值级数); 不存在返回 404。"""
+    from app.backtest.factor_results import load_result
+
+    record = load_result(request.app.state.repo.store.data_dir, run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="结果不存在或已过期")
+    return record
+
+
 # ================================================================
 # 策略回测
 # ================================================================
@@ -249,9 +526,6 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
 
 
 # ── SSE 流式回测 (实时进度 + 可取消 + 支持重连) ───────────────────
-
-import time
-import hashlib
 
 
 class _BacktestJob:

@@ -24,7 +24,14 @@ def _caps() -> CapabilitySet:
 
 
 def _minute_rows(symbol: str, n: int, start: datetime | None = None) -> pl.DataFrame:
-    start = start or datetime.now().replace(hour=9, minute=30, second=0, microsecond=0)
+    # 锚定到最近一个工作日 (≤今天): ensure_symbol_minute_for_chan 的本地可用性检查
+    # 以 date.today() 为窗口右端, 周末直接锚定今天会让 240 根分钟全部落到下周,
+    # 导致测试在周末随机失败 (同样会让全量 CI 在周六/周日翻红)。
+    if start is None:
+        start = datetime.now()
+        while start.weekday() >= 5:
+            start -= timedelta(days=1)
+        start = start.replace(hour=9, minute=30, second=0, microsecond=0)
     rows = []
     t = start
     price = 10.0
