@@ -1,13 +1,27 @@
-import { useState, useMemo } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useState, useMemo, useEffect } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { Play, BarChart3, Clock } from 'lucide-react'
-import { api, type FactorColumn, type FactorBacktestResult, type GroupStat } from '@/lib/api'
+import { Play, BarChart3, Clock, Square, History as HistoryIcon } from 'lucide-react'
+import {
+  api,
+  type FactorColumn,
+  type FactorBacktestResult,
+  type FactorBatchResult,
+  type FactorHistoryItem,
+  type GroupStat,
+} from '@/lib/api'
 import { fmtPct, priceColorClass } from '@/lib/format'
 import { EmptyState } from '@/components/EmptyState'
 import { DatePicker } from '@/components/DatePicker'
 import { FactorICChart } from './charts/FactorICChart'
 import { FactorGroupNavChart } from './charts/FactorGroupNavChart'
+import {
+  useFactorTask,
+  startFactorRun,
+  startFactorBatch,
+  cancelFactorTask,
+  type FactorProgressEvent,
+} from '@/lib/factorTask'
 
 const formatDate = (date: Date) => date.toISOString().slice(0, 10)
 const monthsAgo = (months: number) => {
@@ -20,6 +34,19 @@ const THREE_MONTHS_AGO = monthsAgo(3)
 
 const INPUT_CLS = `w-full px-2.5 py-1.5 rounded-input bg-surface border border-border text-xs
   focus:outline-none focus:border-accent transition-colors duration-150 ease-smooth`
+
+const STAGE_LABELS: Record<string, string> = {
+  pending: '排队等待',
+  panel: '行情面板加载',
+  factor: '因子值计算',
+  returns: '下期收益',
+  ic: '截面 Rank IC',
+  groups: '分层净值',
+  nav: '分层统计',
+  ls: '多空组合',
+  corr: 'IC 相关矩阵',
+  done: '汇总完成',
+}
 
 function StatCard({ label, value, highlight }: {
   label: string
@@ -38,29 +65,47 @@ function StatCard({ label, value, highlight }: {
   )
 }
 
-function LoadingPanel({ symbolsText }: { symbolsText: string }) {
+function LoadingPanel({ symbolsText, progress }: {
+  symbolsText: string
+  progress: FactorProgressEvent[]
+}) {
+  const latest = progress[progress.length - 1]
+  const currentStage = latest?.stage ?? 'pending'
+  const stageOrder = ['pending', 'panel', 'factor', 'returns', 'ic', 'groups', 'nav', 'ls', 'done']
   return (
     <div className="space-y-4">
       <div className="rounded-card border border-accent/25 bg-accent/[0.04] p-4">
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-sm font-medium text-foreground">正在计算因子分析</div>
-            <div className="mt-1 text-xs text-muted">{symbolsText} · 完成后会一次性刷新 IC、分层收益和净值曲线。</div>
+            <div className="mt-1 text-xs text-muted">{symbolsText} · {latest?.message ?? '准备中'}</div>
           </div>
           <div className="h-8 w-8 rounded-full border-2 border-accent/25 border-t-accent animate-spin" />
         </div>
         <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-base">
-          <div className="h-full w-1/2 rounded-full bg-accent/70 animate-pulse" />
+          <div
+            className="h-full rounded-full bg-accent/70 transition-all duration-300"
+            style={{ width: `${Math.max(latest?.pct ?? 0, 4)}%` }}
+          />
         </div>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        {['读取因子', '计算 IC', '分层回测', '汇总指标'].map(item => (
-          <div key={item} className="rounded-btn border border-border bg-surface p-3">
-            <div className="h-2 w-10 rounded bg-accent/30 animate-pulse" />
-            <div className="mt-3 text-xs text-secondary">{item}</div>
-          </div>
-        ))}
+        {stageOrder.map((stage) => {
+          const hit = progress.find(p => p.stage === stage)
+          const done = stageOrder.indexOf(stage) < stageOrder.indexOf(currentStage) || stage === 'done' && latest?.pct === 100
+          return (
+            <div
+              key={stage}
+              className={`rounded-btn border border-border bg-surface p-3
+                ${hit || done ? 'opacity-100' : 'opacity-60'}`}
+            >
+              <div className={`h-2 w-10 rounded ${hit || done ? 'bg-accent/70' : 'bg-accent/20'}`} />
+              <div className="mt-3 text-xs text-secondary">{STAGE_LABELS[stage] ?? stage}</div>
+              {hit && <div className="mt-0.5 text-[10px] text-accent num">{hit.pct}%</div>}
+            </div>
+          )
+        })}
       </div>
 
       <div className="rounded-card border border-border bg-surface p-4">
@@ -80,6 +125,97 @@ function LoadingPanel({ symbolsText }: { symbolsText: string }) {
   )
 }
 
+function BatchResults({ batch }: { batch: FactorBatchResult }) {
+  const names = batch.ic_corr?.names ?? []
+  const matrix = batch.ic_corr?.matrix ?? []
+  return (
+    <div className="space-y-4">
+      <div className="rounded-card border border-border overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-elevated">
+            <tr className="text-left text-secondary">
+              <th className="px-4 py-2.5 font-medium">因子</th>
+              <th className="px-4 py-2.5 font-medium text-right">IC 均值</th>
+              <th className="px-4 py-2.5 font-medium text-right">ICIR</th>
+              <th className="px-4 py-2.5 font-medium text-right">IC 胜率</th>
+              <th className="px-4 py-2.5 font-medium text-right">多空总收益</th>
+              <th className="px-4 py-2.5 font-medium text-right">多空年化</th>
+              <th className="px-4 py-2.5 font-medium text-right">多空夏普</th>
+            </tr>
+          </thead>
+          <tbody>
+            {batch.factors.map((r) => (
+              <tr key={r.name} className="border-t border-border hover:bg-elevated/50 transition-colors">
+                <td className="px-4 py-2 font-medium">{r.name}</td>
+                <td className={`px-4 py-2 text-right num ${priceColorClass(r.ic_mean ?? 0)}`}>
+                  {r.ic_mean != null ? fmtPct(r.ic_mean) : '—'}
+                </td>
+                <td className={`px-4 py-2 text-right num ${priceColorClass(r.ir ?? 0)}`}>
+                  {r.ir != null ? r.ir.toFixed(2) : '—'}
+                </td>
+                <td className="px-4 py-2 text-right num">{r.ic_win_rate != null ? fmtPct(r.ic_win_rate) : '—'}</td>
+                <td className={`px-4 py-2 text-right num ${priceColorClass(r.ls_total_return ?? 0)}`}>
+                  {r.ls_total_return != null ? fmtPct(r.ls_total_return) : '—'}
+                </td>
+                <td className={`px-4 py-2 text-right num ${priceColorClass(r.ls_annual_return ?? 0)}`}>
+                  {r.ls_annual_return != null ? fmtPct(r.ls_annual_return) : '—'}
+                </td>
+                <td className="px-4 py-2 text-right num">{r.ls_sharpe != null ? r.ls_sharpe.toFixed(2) : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {names.length >= 2 && (
+        <div className="rounded-card border border-border bg-surface p-4">
+          <div className="text-xs font-medium text-secondary mb-3">日 IC 相关矩阵</div>
+          <div
+            className="grid gap-px overflow-x-auto"
+            style={{ gridTemplateColumns: `minmax(4rem, auto) repeat(${names.length}, minmax(3rem, 1fr))` }}
+          >
+            <div />
+            {names.map(n => (
+              <div key={`h-${n}`} className="px-1 pb-1 text-center text-[10px] text-muted truncate" title={n}>{n}</div>
+            ))}
+            {names.map((n, i) => (
+              <FragmentRow key={`row-${n}`} name={n} row={matrix[i] ?? []} />
+            ))}
+          </div>
+        </div>
+      )}
+      {batch.skipped.length > 0 && (
+        <div className="text-[11px] text-muted">已跳过无法计算: {batch.skipped.join(', ')}</div>
+      )}
+    </div>
+  )
+}
+
+function FragmentRow({ name, row }: { name: string; row: (number | null)[] }) {
+  return (
+    <>
+      <div className="pr-2 text-right text-[10px] text-muted truncate" title={name}>{name}</div>
+      {row.map((v, j) => {
+        const alpha = v == null ? 0.05 : Math.min(Math.abs(v), 1)
+        const bg = v == null
+          ? 'rgba(128,128,128,0.08)'
+          : v >= 0
+            ? `rgba(240,68,56,${alpha})`
+            : `rgba(18,183,106,${alpha})`
+        return (
+          <div
+            key={j}
+            className="flex items-center justify-center py-1.5 text-[10px] num"
+            style={{ backgroundColor: bg }}
+          >
+            {v != null ? v.toFixed(2) : '—'}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
 export function FactorBacktest() {
   const [factorName, setFactorName] = useState('momentum_20d')
   const [symbols, setSymbols] = useState('')
@@ -87,14 +223,36 @@ export function FactorBacktest() {
   const [start, setStart] = useState(THREE_MONTHS_AGO)
   const [end, setEnd] = useState(TODAY)
   const [nGroups, setNGroups] = useState(5)
+  const [rebalance, setRebalance] = useState<'daily' | 'weekly' | 'monthly'>('monthly')
   const [weight, setWeight] = useState<'equal' | 'factor_weight'>('equal')
   const [fees, setFees] = useState('2')
+  const [slippage, setSlippage] = useState('5')
   const [result, setResult] = useState<FactorBacktestResult | null>(null)
+  const [batchNames, setBatchNames] = useState<string[]>([])
+  const [batchView, setBatchView] = useState<FactorBatchResult | null>(null)
+  const [mode, setMode] = useState<'single' | 'batch' | null>(null)
+
+  const task = useFactorTask()
+  const qc = useQueryClient()
 
   const columns = useQuery({
     queryKey: ['backtest-factor-columns'],
     queryFn: api.factorColumns,
   })
+
+  const history = useQuery({
+    queryKey: ['backtest-factor-history'],
+    queryFn: () => api.factorHistory(20),
+  })
+
+  // 任务完成 → 收敛到组件状态
+  useEffect(() => {
+    if (task.phase === 'done') {
+      if (task.result) setResult(task.result)
+      if (task.batch) setBatchView(task.batch)
+      qc.invalidateQueries({ queryKey: ['backtest-factor-history'] })
+    }
+  }, [task.phase, task.result, task.batch, qc])
 
   // 按 group 分类的因子
   const factorGroups = useMemo(() => {
@@ -106,32 +264,67 @@ export function FactorBacktest() {
     return groups
   }, [columns.data])
 
+  const allFactorIds = useMemo(
+    () => (columns.data?.columns ?? []).map(c => c.id),
+    [columns.data],
+  )
+
   // 当前因子描述
   const factorDesc = useMemo(() => {
     return columns.data?.columns.find(c => c.id === factorName)?.desc ?? ''
   }, [columns.data, factorName])
 
-  const run = useMutation({
-    mutationFn: () =>
-      api.factorRun({
-        factor_name: factorName,
-        asset_type: assetType,
-        symbols: symbols ? symbols.split(',').map(s => s.trim()).filter(Boolean) : null,
-        start: start || null,
-        end: end || undefined,
-        n_groups: nGroups,
-        rebalance: 'daily',
-        weight,
-        fees_pct: Number(fees) / 10000,
-      }),
-    onSuccess: (data) => {
-      if (data.error) {
-        setResult(data)
-      } else {
-        setResult(data)
+  const running = task.phase === 'running'
+  const sharedParams = {
+    asset_type: assetType,
+    symbols: symbols.trim() || undefined,
+    start: start || undefined,
+    end: end || undefined,
+    n_groups: nGroups,
+    rebalance,
+    fees_pct: Number(fees) / 10000,
+    slippage_bps: Number(slippage) / 10000,
+  }
+
+  const beginRun = () => {
+    setMode('single')
+    startFactorRun({ factor_name: factorName, weight, ...sharedParams })
+  }
+
+  const beginBatch = () => {
+    if (batchNames.length === 0) return
+    setMode('batch')
+    startFactorBatch({ factor_names: batchNames.join(','), ...sharedParams })
+  }
+
+  const toggleBatchName = (id: string) => {
+    setBatchNames(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
+  }
+
+  const openHistory = async (item: FactorHistoryItem) => {
+    try {
+      const record = await api.factorHistoryItem(item.run_id)
+      const data = record.data
+      if (record.kind === 'batch') {
+        setMode('batch')
+        setBatchView(data as FactorBatchResult)
+        return
       }
-    },
-  })
+      setMode('single')
+      const cfg = data.config ?? {}
+      if (cfg.factor_name) setFactorName(cfg.factor_name)
+      if (Array.isArray(cfg.symbols)) setSymbols(cfg.symbols.join(', '))
+      if (cfg.start) setStart(cfg.start)
+      if (cfg.end) setEnd(cfg.end)
+      if (cfg.n_groups) setNGroups(cfg.n_groups)
+      if (cfg.rebalance) setRebalance(cfg.rebalance)
+      if (cfg.weight) setWeight(cfg.weight)
+      setFees(String(Math.round((cfg.fees_pct ?? 0.0002) * 10000)))
+      setSlippage(String(Math.round(cfg.slippage_bps ?? 5)))
+      if (cfg.asset_type === 'etf' || cfg.asset_type === 'stock') setAssetType(cfg.asset_type)
+      setResult(data as FactorBacktestResult)
+    } catch { /* toast 已由 request 层处理 */ }
+  }
 
   const applyRange = (months: number) => {
     setStart(monthsAgo(months))
@@ -165,6 +358,8 @@ export function FactorBacktest() {
     ? 'bg-accent/15 text-accent'
     : 'text-muted hover:bg-elevated/70 hover:text-secondary'
   }`
+
+  const showBatch = mode === 'batch'
 
   return (
     <div className="h-full min-h-0 overflow-hidden rounded-card border border-border bg-surface/80 grid grid-cols-1 xl:grid-cols-[18rem_minmax(0,1fr)]">
@@ -274,6 +469,14 @@ export function FactorBacktest() {
             </select>
           </div>
           <div>
+            <label className="text-xs font-medium text-secondary block mb-1.5">调仓频率</label>
+            <select value={rebalance} onChange={e => setRebalance(e.target.value as any)} className={INPUT_CLS}>
+              <option value="daily">日度</option>
+              <option value="weekly">周度</option>
+              <option value="monthly">月度</option>
+            </select>
+          </div>
+          <div>
             <label className="text-xs font-medium text-secondary block mb-1.5">权重</label>
             <select value={weight} onChange={e => setWeight(e.target.value as any)} className={INPUT_CLS}>
               <option value="equal">等权</option>
@@ -285,35 +488,126 @@ export function FactorBacktest() {
             <input type="number" value={fees} onChange={e => setFees(e.target.value)}
               className={INPUT_CLS} />
           </div>
+          <div>
+            <label className="text-xs font-medium text-secondary block mb-1.5">滑点(万分之)</label>
+            <input type="number" value={slippage} onChange={e => setSlippage(e.target.value)}
+              className={INPUT_CLS} />
+          </div>
         </div>
 
-        <button
-          onClick={() => run.mutate()}
-          disabled={run.isPending}
-          className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-btn
-            bg-accent text-sm font-medium hover:bg-accent/90
-            transition-colors duration-150 ease-smooth disabled:opacity-50"
-        >
-          <Play className="h-3.5 w-3.5" />
-          {run.isPending ? '分析中…' : '开始因子分析'}
-        </button>
+        {running ? (
+          <button
+            onClick={() => cancelFactorTask()}
+            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-btn
+              bg-danger/15 text-danger text-sm font-medium hover:bg-danger/25
+              transition-colors duration-150 ease-smooth"
+          >
+            <Square className="h-3.5 w-3.5" />
+            取消分析
+          </button>
+        ) : (
+          <button
+            onClick={beginRun}
+            disabled={running}
+            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-btn
+              bg-accent text-sm font-medium hover:bg-accent/90
+              transition-colors duration-150 ease-smooth disabled:opacity-50"
+          >
+            <Play className="h-3.5 w-3.5" />
+            开始因子分析
+          </button>
+        )}
+
+        {/* 批量评估 */}
+        <div className="rounded-btn border border-border bg-surface p-2.5">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-medium text-foreground">批量评估</div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="text-[10px] text-accent hover:underline cursor-pointer"
+                onClick={() => setBatchNames(allFactorIds)}
+              >全选</button>
+              <button
+                type="button"
+                className="text-[10px] text-muted hover:underline cursor-pointer"
+                onClick={() => setBatchNames([])}
+              >清空</button>
+            </div>
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-1.5">
+            {(columns.data?.columns ?? []).map(c => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => toggleBatchName(c.id)}
+                className={`rounded-input border px-1 py-1 text-[10px] transition-colors cursor-pointer
+                  ${batchNames.includes(c.id)
+                    ? 'border-accent/50 bg-accent/10 text-accent'
+                    : 'border-border text-muted hover:text-secondary'}`}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={beginBatch}
+            disabled={running || batchNames.length === 0}
+            className="mt-2 w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-btn
+              bg-accent/15 text-accent text-xs font-medium hover:bg-accent/25
+              transition-colors duration-150 ease-smooth disabled:opacity-40 cursor-pointer"
+          >
+            <Play className="h-3 w-3" />
+            批量评估 {batchNames.length > 0 ? `(${batchNames.length})` : ''}
+          </button>
+        </div>
+
+        {/* 历史记录 */}
+        <div className="rounded-btn border border-border bg-surface p-2.5">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+            <HistoryIcon className="h-3.5 w-3.5" />
+            历史记录
+          </div>
+          <div className="mt-2 space-y-1.5 max-h-56 overflow-y-auto">
+            {(history.data?.items ?? []).map(item => (
+              <button
+                key={item.run_id}
+                type="button"
+                onClick={() => openHistory(item)}
+                className="w-full rounded-input border border-border px-2 py-1.5 text-left hover:bg-elevated/60 transition-colors cursor-pointer"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-[11px] text-foreground truncate">
+                    {item.kind === 'batch' ? `批量 × ${item.factor_count}` : item.factor_name}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-muted">{item.created_at?.slice(5, 16)}</span>
+                </div>
+                <div className="mt-0.5 flex items-center gap-2 text-[10px] text-muted">
+                  {item.ic_mean != null && (
+                    <span className={priceColorClass(item.ic_mean)}>IC {fmtPct(item.ic_mean)}</span>
+                  )}
+                  {item.ls_total_return != null && (
+                    <span className={priceColorClass(item.ls_total_return)}>多空 {fmtPct(item.ls_total_return)}</span>
+                  )}
+                </div>
+              </button>
+            ))}
+            {!history.data?.items?.length && (
+              <div className="text-[11px] text-muted py-2 text-center">暂无历史结果</div>
+            )}
+          </div>
+        </div>
       </section>
 
       {/* 结果面板 */}
       <section className="min-w-0 space-y-3 bg-base/15 px-3 py-3 xl:overflow-y-auto">
-        {result?.error && !result.ic_mean && (
+        {task.phase === 'error' && task.error && (
           <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
-            {result.error}
+            {task.error}
           </div>
         )}
 
-        {run.isError && (
-          <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
-            {String((run.error as any).message)}
-          </div>
-        )}
-
-        {!result && !run.isPending && (
+        {!result && !batchView && !running && (
           <EmptyState
             icon={BarChart3}
             title="选择因子并开始分析"
@@ -321,17 +615,46 @@ export function FactorBacktest() {
           />
         )}
 
-        {run.isPending && result && (
+        {running && !result && !showBatch && (
+          <LoadingPanel
+            symbolsText={symbols ? `${symbols.split(',').length} 只标的` : '全市场 · 当前区间'}
+            progress={task.progress}
+          />
+        )}
+        {running && result && (
           <div className="rounded-card border border-accent/25 bg-accent/[0.04] px-4 py-3 text-xs text-secondary">
             正在重新计算，当前暂时展示上一次因子分析结果，完成后会自动替换。
           </div>
         )}
-
-        {run.isPending && !result && (
-          <LoadingPanel symbolsText={symbols ? `${symbols.split(',').length} 只标的` : '全市场 · 当前区间'} />
+        {running && !result && showBatch && (
+          <LoadingPanel
+            symbolsText={`批量 ${batchNames.length} 个因子`}
+            progress={task.progress}
+          />
         )}
 
-        {result && result.ic_mean != null && (
+        {/* 批量视图 */}
+        {showBatch && !running && batchView && (
+          <div className="rounded-card border border-border bg-surface p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-medium text-foreground">批量因子评估</h3>
+              <div className="flex items-center gap-2 text-[11px] text-muted">
+                {batchView.n_symbols} 只 · {batchView.n_dates} 日 · {batchView.elapsed_ms} ms
+              </div>
+            </div>
+            <BatchResults batch={batchView} />
+          </div>
+        )}
+        {showBatch && !running && !batchView && (
+          <EmptyState
+            icon={BarChart3}
+            title="批量因子评估"
+            hint="在左侧勾选多个因子后点击「批量评估」，一次比较各因子的 IC/IR 与多空收益，并给出因子间 IC 相关矩阵。"
+          />
+        )}
+
+        {/* 单因子结果 */}
+        {result && result.ic_mean != null && !showBatch && (
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -343,8 +666,11 @@ export function FactorBacktest() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-medium text-foreground">因子预测能力</h3>
                 <div className="flex items-center gap-2">
+                  {/* 频率标签跟随实际执行配置 (后端回显的 result.config), 不再硬编码 */}
                   <span className="text-[11px] text-muted">
-                    Rank IC · 日度调仓
+                    Rank IC · {({ daily: '日度调仓', weekly: '周度调仓', monthly: '月度调仓' } as const)[
+                      (result.config?.rebalance as 'daily' | 'weekly' | 'monthly') ?? 'daily'
+                    ] ?? '日度调仓'}
                   </span>
                   {result.elapsed_ms > 0 && (
                     <span className="flex items-center gap-1 text-[11px] text-muted">
@@ -436,12 +762,21 @@ export function FactorBacktest() {
                         <td className={`px-4 py-2 text-right num font-medium ${priceColorClass(result.long_short_stats.total_return)}`}>
                           {fmtPct(result.long_short_stats.total_return as number)}
                         </td>
-                        <td className="px-4 py-2 text-right num">—</td>
+                        <td className={`px-4 py-2 text-right num ${priceColorClass(result.long_short_stats.annual_return as number)}`}>
+                          {result.long_short_stats.annual_return != null
+                            ? fmtPct(result.long_short_stats.annual_return as number) : '—'}
+                        </td>
                         <td className="px-4 py-2 text-right num text-bear">
                           {fmtPct(result.long_short_stats.max_drawdown as number)}
                         </td>
-                        <td className="px-4 py-2 text-right num">—</td>
-                        <td className="px-4 py-2 text-right num">—</td>
+                        <td className="px-4 py-2 text-right num">
+                          {result.long_short_stats.sharpe != null
+                            ? (result.long_short_stats.sharpe as number).toFixed(2) : '—'}
+                        </td>
+                        <td className="px-4 py-2 text-right num">
+                          {result.long_short_stats.win_rate != null
+                            ? fmtPct(result.long_short_stats.win_rate as number) : '—'}
+                        </td>
                       </tr>
                     )}
                   </tbody>

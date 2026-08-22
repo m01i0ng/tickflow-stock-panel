@@ -897,6 +897,53 @@ export interface FactorBacktestResult {
   error: string | null
 }
 
+/** 批量评估单因子行 */
+export interface FactorBatchRow {
+  name: string
+  ic_mean: number | null
+  ic_std: number | null
+  ir: number | null
+  ic_win_rate: number | null
+  ic_obs: number
+  ls_total_return: number | null
+  ls_annual_return: number | null
+  ls_sharpe: number | null
+  ls_win_rate: number | null
+}
+
+/** 批量评估结果 */
+export interface FactorBatchResult {
+  run_id: string
+  config: Record<string, any>
+  factors: FactorBatchRow[]
+  skipped: string[]
+  ic_corr: { names: string[]; matrix: (number | null)[][] }
+  n_symbols: number
+  n_dates: number
+  elapsed_ms: number
+  error: string | null
+}
+
+/** 历史结果摘要 */
+export interface FactorHistoryItem {
+  run_id: string
+  kind: 'single' | 'batch'
+  created_at: string
+  factor_name?: string
+  factor_count?: number
+  skipped?: string[]
+  config?: Record<string, any>
+  ic_mean?: number | null
+  ir?: number | null
+  ic_win_rate?: number | null
+  ls_total_return?: number | null
+  ls_annual_return?: number | null
+  ls_sharpe?: number | null
+  n_symbols?: number
+  n_dates?: number
+  elapsed_ms?: number
+}
+
 // ===== Strategy Backtest =====
 export interface StrategyBacktestTrade {
   symbol: string
@@ -1772,6 +1819,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  /** 取消运行中的因子任务 (job_key 来自 SSE start 事件) */
+  factorCancel: (jobKey: string) =>
+    request<{ ok: boolean; message?: string }>('/api/backtest/factor/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ job_key: jobKey }),
+    }),
+
+  /** 历史因子结果摘要 (新到旧) */
+  factorHistory: (limit = 20) =>
+    request<{ items: FactorHistoryItem[] }>(`/api/backtest/factor/history?limit=${limit}`),
+
+  /** 完整加载一次历史结果 (含净值级数) */
+  factorHistoryItem: (runId: string) =>
+    request<{ run_id: string; kind: string; created_at: string; data: Record<string, any> }>(
+      `/api/backtest/factor/history/${encodeURIComponent(runId)}`,
+    ),
 
   strategyBacktestRun: (payload: {
     strategy_id: string
